@@ -116,6 +116,8 @@ def platform_config_dir() -> Path:
     if os.name == "nt":
         root = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
         return root / "Resolve Freesound Browser"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "Resolve Freesound Browser"
     root = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
     return root / "resolve-freesound-browser"
 
@@ -124,6 +126,8 @@ def platform_cache_dir() -> Path:
     if os.name == "nt":
         root = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
         return root / "Resolve Freesound Browser" / "Cache"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Caches" / "Resolve Freesound Browser"
     root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
     return root / "resolve-freesound-browser"
 
@@ -331,10 +335,24 @@ def selection_is_full(start_fraction: float, end_fraction: float) -> bool:
     return start_fraction <= 0.001 and end_fraction >= 0.999
 
 
+def ffmpeg_binary() -> str | None:
+    """Locate the ffmpeg executable, incl. common Homebrew paths on macOS
+    (GUI apps launched from Finder/Dock don't inherit the shell PATH)."""
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    if sys.platform == "darwin":
+        for candidate in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"):
+            if os.path.exists(candidate):
+                return candidate
+    return None
+
+
 def trim_preview_file(source: Path, sound: dict[str, Any], start_fraction: float, end_fraction: float, target_dir: Path | None = None) -> Path:
     if selection_is_full(start_fraction, end_fraction):
         return source
-    if not shutil.which("ffmpeg"):
+    ffmpeg = ffmpeg_binary()
+    if not ffmpeg:
         raise RuntimeError("ffmpeg is required for trimmed drag/download/import.")
 
     duration = sound_duration_seconds(sound)
@@ -362,7 +380,7 @@ def trim_preview_file(source: Path, sound: dict[str, Any], start_fraction: float
 
     log.info("Trimming sound %s to [%.3f, %.3f]s -> %s", sound_id(sound), start, end, target)
     command = [
-        "ffmpeg",
+        ffmpeg,
         "-y",
         "-hide_banner",
         "-loglevel",
@@ -382,7 +400,7 @@ def trim_preview_file(source: Path, sound: dict[str, Any], start_fraction: float
     except subprocess.CalledProcessError as exc:
         log.warning("ffmpeg stream copy failed (%s); retrying with re-encode", (exc.stderr or "").strip())
         command = [
-            "ffmpeg",
+            ffmpeg,
             "-y",
             "-hide_banner",
             "-loglevel",
@@ -758,6 +776,25 @@ def get_resolve():
     if sys.platform.startswith("linux"):
         os.environ.setdefault("RESOLVE_SCRIPT_API", "/opt/resolve/Developer/Scripting")
         os.environ.setdefault("RESOLVE_SCRIPT_LIB", "/opt/resolve/libs/Fusion/fusionscript.so")
+    elif sys.platform == "darwin":
+        os.environ.setdefault(
+            "RESOLVE_SCRIPT_API",
+            "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting",
+        )
+        os.environ.setdefault(
+            "RESOLVE_SCRIPT_LIB",
+            "/Applications/DaVinci Resolve/DaVinci Resolve.app/Contents/Libraries/Fusion/fusionscript.so",
+        )
+    elif os.name == "nt":
+        program_data = os.environ.get("PROGRAMDATA", "C:\\ProgramData")
+        os.environ.setdefault(
+            "RESOLVE_SCRIPT_API",
+            os.path.join(program_data, "Blackmagic Design", "DaVinci Resolve", "Support", "Developer", "Scripting"),
+        )
+        os.environ.setdefault(
+            "RESOLVE_SCRIPT_LIB",
+            "C:\\Program Files\\Blackmagic Design\\DaVinci Resolve\\fusionscript.dll",
+        )
 
     module = importlib.import_module("DaVinciResolveScript")
     return module.scriptapp("Resolve")
@@ -785,7 +822,7 @@ def import_into_resolve(paths: list[Path]) -> int:
 
 
 def ffmpeg_available() -> bool:
-    return shutil.which("ffmpeg") is not None
+    return ffmpeg_binary() is not None
 
 
 def ffmpeg_install_command() -> list[str] | None:
@@ -811,8 +848,13 @@ def ffmpeg_install_command() -> list[str] | None:
                 "--id", "Gyan.FFmpeg",
             ]
         return None
-    if sys.platform == "darwin" and shutil.which("brew"):
-        return ["brew", "install", "ffmpeg"]
+    if sys.platform == "darwin":
+        brew = shutil.which("brew") or next(
+            (p for p in ("/opt/homebrew/bin/brew", "/usr/local/bin/brew") if os.path.exists(p)), None
+        )
+        if brew:
+            return [brew, "install", "ffmpeg"]
+        return None
     return None
 
 
@@ -1028,6 +1070,7 @@ class SoundRowWidget(QWidget):
 
 class SoundListWidget(QListWidget):
     dragStarted = Signal()
+    dragFinished = Signal(str)
 
     def __init__(self, file_provider, parent=None):
         super().__init__(parent)
@@ -1044,12 +1087,14 @@ class SoundListWidget(QListWidget):
         drag = QDrag(self)
         drag.setMimeData(mime)
         drag.exec(Qt.CopyAction)
+        self.dragFinished.emit(str(path))
 
 
 class WaveformEditor(QWidget):
     selectionChanged = Signal(float, float)
     seekRequested = Signal(float)
     dragStarted = Signal()
+    dragFinished = Signal(str)
 
     def __init__(self, file_provider, parent=None):
         super().__init__(parent)
@@ -1188,6 +1233,7 @@ class WaveformEditor(QWidget):
                     drag = QDrag(self)
                     drag.setMimeData(mime)
                     drag.exec(Qt.CopyAction)
+                    self.dragFinished.emit(str(path))
                 self.drag_start_pos = None
                 return
 
@@ -1352,6 +1398,9 @@ class FreesoundBrowser(QMainWindow):
         self.settings_action = QAction("API key", self)
         self.settings_action.triggered.connect(self.open_settings)
 
+        self.download_folder_action = QAction("Download folder…", self)
+        self.download_folder_action.triggered.connect(self.choose_download_folder)
+
         self.install_ffmpeg_action = QAction("Install ffmpeg…", self)
         self.install_ffmpeg_action.triggered.connect(lambda: self.prompt_ffmpeg_install(force=True))
 
@@ -1419,6 +1468,7 @@ class FreesoundBrowser(QMainWindow):
         self.settings_button.setPopupMode(QToolButton.InstantPopup)
         settings_menu = QMenu(self)
         settings_menu.addAction(self.settings_action)
+        settings_menu.addAction(self.download_folder_action)
         settings_menu.addAction(self.install_ffmpeg_action)
         self.settings_button.setMenu(settings_menu)
 
@@ -1463,6 +1513,7 @@ class FreesoundBrowser(QMainWindow):
         self.results.itemDoubleClicked.connect(lambda _item: self.on_list_double(self.results))
         self.results.verticalScrollBar().valueChanged.connect(self.maybe_load_more)
         self.results.dragStarted.connect(self.record_current_use)
+        self.results.dragFinished.connect(self.on_drag_finished)
         list_layout.addWidget(self.results, 1)
         self.left_tabs.addTab(results_panel, "Results")
 
@@ -1489,6 +1540,7 @@ class FreesoundBrowser(QMainWindow):
         self.library_list.itemSelectionChanged.connect(lambda: self.on_list_selection(self.library_list))
         self.library_list.itemDoubleClicked.connect(lambda _item: self.on_list_double(self.library_list))
         self.library_list.dragStarted.connect(self.record_current_use)
+        self.library_list.dragFinished.connect(self.on_drag_finished)
         library_layout.addWidget(self.library_list, 1)
         self.left_tabs.addTab(library_panel, "Library")
 
@@ -1511,6 +1563,7 @@ class FreesoundBrowser(QMainWindow):
         self.large_waveform.selectionChanged.connect(self.selection_changed_on_waveform)
         self.large_waveform.seekRequested.connect(self.on_waveform_seek)
         self.large_waveform.dragStarted.connect(self.record_current_use)
+        self.large_waveform.dragFinished.connect(self.on_drag_finished)
         detail_layout.addWidget(self.large_waveform)
 
         controls = QHBoxLayout()
@@ -1902,6 +1955,16 @@ class FreesoundBrowser(QMainWindow):
         log.warning("Media player error: %s (%s)", error_string or "unknown", error)
         if error_string:
             self.status_label.setText(error_string)
+
+    def choose_download_folder(self) -> None:
+        current = self.config.get("download_dir", str(DEFAULT_DOWNLOAD_DIR))
+        selected = QFileDialog.getExistingDirectory(self, "Choose download folder", current)
+        if not selected:
+            return
+        self.config["download_dir"] = selected
+        save_config(self.config)
+        self.status_label.setText(f"Download folder: {selected}")
+        log.info("Download folder set to %s", selected)
 
     def open_settings(self) -> None:
         dialog = SettingsDialog(self.config, self)
@@ -2522,6 +2585,9 @@ class FreesoundBrowser(QMainWindow):
         self.select_library_source(name)
 
     def current_drag_file(self) -> Path | None:
+        # The drag source is the fast local cache file (no blocking copy, so it
+        # never stutters for longer clips). After a drop, on_drag_finished copies
+        # it into the user's Download folder.
         if self.current_clip_file and self.current_clip_file.exists():
             return self.current_clip_file
         if self.current_preview_file and self.current_preview_file.exists():
@@ -2533,6 +2599,26 @@ class FreesoundBrowser(QMainWindow):
                 if selection_is_full(self.selection_start, self.selection_end):
                     return cached
         return None
+
+    def on_drag_finished(self, path: str) -> None:
+        # After the drag gesture completes, copy the dragged file into the
+        # Download folder (in the background) so it also lives there.
+        source = Path(path)
+        if not source.exists():
+            return
+        download_dir = Path(self.config.get("download_dir", str(DEFAULT_DOWNLOAD_DIR))).expanduser()
+
+        def do_copy():
+            download_dir.mkdir(parents=True, exist_ok=True)
+            target = download_dir / source.name
+            if not target.exists() or target.stat().st_size != source.stat().st_size:
+                shutil.copy2(source, target)
+                log.info("Copied dragged sound to %s", target)
+            return target
+
+        worker = FunctionWorker(do_copy, label="drag-copy")
+        worker.signals.error.connect(lambda message: log.warning("Drag copy failed: %s", message))
+        self.start_worker(worker)
 
     def selection_key(self) -> tuple[str, int, int] | None:
         if not self.current_sound:
