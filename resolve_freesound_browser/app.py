@@ -20,7 +20,7 @@ from typing import Any
 from resolve_freesound_browser.logging_setup import LOGGER_NAME, install_excepthook, setup_logging
 from resolve_freesound_browser.store import HISTORY_KEY, LibraryStore
 
-from PySide6.QtCore import QMimeData, QObject, QPoint, QRect, QRunnable, QSize, Qt, QThreadPool, QTimer, QUrl, Signal
+from PySide6.QtCore import QMimeData, QObject, QPoint, QRect, QRectF, QRunnable, QSize, Qt, QThreadPool, QTimer, QUrl, Signal
 from PySide6.QtGui import (
     QAction,
     QBrush,
@@ -135,6 +135,7 @@ PREVIEW_CACHE_DIR = platform_cache_dir() / "previews"
 CLIP_CACHE_DIR = platform_cache_dir() / "clips"
 LOG_DIR = platform_cache_dir() / "logs"
 DEFAULT_DOWNLOAD_DIR = Path.home() / "Freesound Downloads"
+RESOURCES_DIR = Path(__file__).resolve().parents[1] / "resources"
 
 log = logging.getLogger(LOGGER_NAME)
 
@@ -147,6 +148,10 @@ def load_config() -> dict[str, Any]:
         "page_size": DEFAULT_PAGE_SIZE,
         "volume": 80,
         "sort": DEFAULT_SORT,
+        "source": "freesound",
+        "openverse_filters": {},
+        "openverse_client_id": "",
+        "openverse_client_secret": "",
     }
     try:
         data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
@@ -228,12 +233,14 @@ def extension_from_url(url: str, fallback: str) -> str:
     return fallback
 
 
-def auth_download_bytes(url: str, api_key: str = "") -> bytes:
+def auth_download_bytes(url: str, api_key: str = "", authorization: str = "") -> bytes:
     headers = {"User-Agent": "ResolveFreesoundBrowser/0.2"}
-    if api_key:
+    if authorization:
+        headers["Authorization"] = authorization
+    elif api_key:
         headers["Authorization"] = f"Token {api_key}"
     request = urllib.request.Request(url, headers=headers)
-    log.debug("GET %s (auth=%s)", url, bool(api_key))
+    log.debug("GET %s (auth=%s)", url, bool(authorization or api_key))
     started = time.perf_counter()
     try:
         with urllib.request.urlopen(request, timeout=60) as response:
@@ -253,8 +260,8 @@ def auth_download_bytes(url: str, api_key: str = "") -> bytes:
     return data
 
 
-def request_json(url: str, api_key: str) -> dict[str, Any]:
-    return json.loads(auth_download_bytes(url, api_key).decode("utf-8"))
+def request_json(url: str, api_key: str = "", authorization: str = "") -> dict[str, Any]:
+    return json.loads(auth_download_bytes(url, api_key, authorization).decode("utf-8"))
 
 
 def sound_id(sound: dict[str, Any]) -> str:
@@ -303,6 +310,21 @@ def rating_stars(value: Any, maximum: int = 5) -> str:
         return ""
     filled = max(0, min(maximum, int(round(rating))))
     return "★" * filled + "☆" * (maximum - filled)
+
+
+OPENVERSE_SOURCE_LABELS = {
+    "jamendo": "Jamendo",
+    "wikimedia_audio": "Wikimedia",
+    "freesound": "Freesound",
+}
+
+
+def source_label(sound: dict[str, Any]) -> str:
+    """Human-readable provider name for an Openverse sound (else empty)."""
+    source = sound.get("_source") or ""
+    if not source:
+        return ""
+    return OPENVERSE_SOURCE_LABELS.get(source, source.replace("_", " ").title())
 
 
 def selection_is_full(start_fraction: float, end_fraction: float) -> bool:
@@ -434,6 +456,9 @@ class FreesoundClient:
         log.debug("Fetching page %s", url)
         return request_json(url, self.api_key)
 
+    def fetch_more(self, url: str) -> dict[str, Any]:
+        return self.fetch_url(url)
+
     def preview_cache_path(self, sound: dict[str, Any], target_dir: Path | None = None) -> Path:
         url = preview_url(sound)
         suffix = extension_from_url(url, ".mp3")
@@ -470,6 +495,229 @@ class FreesoundClient:
         if not target.exists() or target.stat().st_size == 0:
             log.debug("Downloading waveform for sound %s", sound_id(sound))
             target.write_bytes(auth_download_bytes(url, self.api_key))
+        return target
+
+
+OPENVERSE_BASE = "https://api.openverse.org/v1"
+
+# (label, api value) for the Openverse filter UI.
+OPENVERSE_SOURCES = [
+    ("Freesound", "freesound"),
+    ("Jamendo", "jamendo"),
+    ("Wikimedia Commons", "wikimedia_audio"),
+]
+OPENVERSE_CATEGORIES = [
+    ("Hörbuch", "audiobook"),
+    ("Musik", "music"),
+    ("News", "news"),
+    ("Podcast", "podcast"),
+    ("Aussprache", "pronunciation"),
+    ("Soundeffekte", "sound_effect"),
+]
+OPENVERSE_LICENSES = [
+    ("Public Domain Mark", "pdm"),
+    ("CC0", "cc0"),
+    ("CC BY", "by"),
+]
+# Freesound is excluded by default so Openverse only adds NEW content (no dupes).
+OPENVERSE_DEFAULT_SOURCES = ["jamendo", "wikimedia_audio"]
+OPENVERSE_DEFAULT_LICENSES = ["pdm", "cc0", "by"]
+# Anonymous Openverse requests are capped at page_size 20; a token lifts this.
+OPENVERSE_ANON_PAGE_SIZE = 20
+OPENVERSE_AUTH_PAGE_SIZE = 50
+
+
+def normalize_openverse_sound(raw: dict[str, Any]) -> dict[str, Any]:
+    """Map an Openverse audio result onto the app's internal sound shape."""
+    tags = [t.get("name") for t in (raw.get("tags") or []) if isinstance(t, dict) and t.get("name")]
+    duration_ms = raw.get("duration") or 0
+    try:
+        duration_s = float(duration_ms) / 1000.0
+    except (TypeError, ValueError):
+        duration_s = 0.0
+    filetype = (raw.get("filetype") or "").lower()
+    if filetype.startswith("mp3"):  # Jamendo uses codes like mp31/mp32
+        filetype = "mp3"
+    return {
+        "id": raw.get("id"),
+        "name": raw.get("title") or "Untitled",
+        "username": raw.get("creator") or "",
+        "duration": duration_s,
+        "type": filetype,
+        "filesize": raw.get("filesize"),
+        "samplerate": raw.get("sample_rate"),
+        "previews": {"preview-hq-mp3": raw.get("url") or ""},
+        "url": raw.get("foreign_landing_url") or raw.get("url") or "",
+        "tags": tags,
+        "avg_rating": 0,
+        "num_downloads": "",
+        "created": (raw.get("indexed_on") or "")[:10],
+        "description": raw.get("attribution") or "",
+        "_provider": "openverse",
+        "_license": (raw.get("license") or "").upper(),
+        "_license_url": raw.get("license_url") or "",
+        "_source": raw.get("source") or "",
+        "_waveform_url": raw.get("waveform") or "",
+    }
+
+
+def render_waveform_png(peaks: list[float], target: Path, width: int = 780, height: int = 300) -> None:
+    """Draw amplitude peaks (0..1) as a Freesound-style filled waveform PNG.
+
+    Uses QImage/QPainter (safe off the GUI thread) so the row/detail views can
+    load it exactly like a downloaded Freesound waveform image.
+    """
+    from PySide6.QtGui import QImage
+
+    image = QImage(width, height, QImage.Format_ARGB32)
+    image.fill(Qt.transparent)
+    painter = QPainter(image)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+
+    gradient = QLinearGradient(0, 0, width, 0)
+    gradient.setColorAt(0.0, QColor("#8ac926"))
+    gradient.setColorAt(0.5, QColor("#f0b429"))
+    gradient.setColorAt(1.0, QColor("#e8532b"))
+    painter.setPen(Qt.NoPen)
+    painter.setBrush(QBrush(gradient))
+
+    count = len(peaks)
+    center = height / 2.0
+    if count > 0:
+        for x in range(width):
+            peak = peaks[int(x * count / width)]
+            try:
+                amp = max(0.0, min(1.0, float(peak)))
+            except (TypeError, ValueError):
+                amp = 0.0
+            bar_h = max(1.0, amp * (height - 6))
+            painter.drawRect(QRectF(x, center - bar_h / 2.0, 1.0, bar_h))
+    painter.end()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    image.save(str(target), "PNG")
+
+
+class OpenverseClient:
+    """Openverse audio provider (Jamendo, Wikimedia, …). Anonymous by default.
+
+    Anonymous requests are capped at page_size 20. Supplying a client_id /
+    client_secret (registered once at api.openverse.org) fetches a bearer token
+    that lifts the page-size cap and raises the rate limits.
+    """
+
+    def __init__(self, client_id: str = "", client_secret: str = ""):
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self._token = ""
+        self._token_expiry = 0.0
+
+    def set_credentials(self, client_id: str, client_secret: str) -> None:
+        if (client_id, client_secret) != (self.client_id, self.client_secret):
+            self.client_id = client_id
+            self.client_secret = client_secret
+            self._token = ""
+            self._token_expiry = 0.0
+
+    def _bearer(self) -> str:
+        """Return an Authorization header value, refreshing the token if needed."""
+        if not (self.client_id and self.client_secret):
+            return ""
+        if self._token and time.time() < self._token_expiry - 30:
+            return f"Bearer {self._token}"
+        try:
+            body = urllib.parse.urlencode({
+                "client_id": self.client_id,
+                "client_secret": self.client_secret,
+                "grant_type": "client_credentials",
+            }).encode()
+            request = urllib.request.Request(
+                f"{OPENVERSE_BASE}/auth_tokens/token/",
+                data=body,
+                headers={
+                    "User-Agent": "ResolveFreesoundBrowser/0.2",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+            )
+            with urllib.request.urlopen(request, timeout=30) as response:
+                data = json.loads(response.read().decode())
+            self._token = data.get("access_token", "")
+            self._token_expiry = time.time() + float(data.get("expires_in") or 0)
+            log.info("Obtained Openverse access token (expires in %ss)", data.get("expires_in"))
+        except Exception:
+            log.warning("Failed to obtain Openverse token; falling back to anonymous", exc_info=True)
+            self._token = ""
+        return f"Bearer {self._token}" if self._token else ""
+
+    def _page_size(self, requested: int) -> int:
+        limit = OPENVERSE_AUTH_PAGE_SIZE if (self.client_id and self.client_secret) else OPENVERSE_ANON_PAGE_SIZE
+        return max(1, min(requested, limit))
+
+    def build_search_url(self, query: str, filters: dict[str, Any], page_size: int, page: int = 1) -> str:
+        params: dict[str, str] = {
+            "q": query,
+            "page_size": str(self._page_size(page_size)),
+            "page": str(page),
+        }
+        if filters.get("sources"):
+            params["source"] = ",".join(filters["sources"])
+        if filters.get("categories"):
+            params["category"] = ",".join(filters["categories"])
+        if filters.get("licenses"):
+            params["license"] = ",".join(filters["licenses"])
+        if filters.get("license_type"):
+            params["license_type"] = ",".join(filters["license_type"])
+        return f"{OPENVERSE_BASE}/audio/?{urllib.parse.urlencode(params)}"
+
+    def search(self, query: str, filters: dict[str, Any], page_size: int) -> dict[str, Any]:
+        url = self.build_search_url(query, filters, page_size, page=1)
+        log.info("Openverse search: query=%r filters=%s", query, filters)
+        return self.fetch_more(url)
+
+    def fetch_more(self, url: str) -> dict[str, Any]:
+        raw = request_json(url, authorization=self._bearer())
+        results = [normalize_openverse_sound(r) for r in raw.get("results", [])]
+        page = int(raw.get("page") or 1)
+        page_count = int(raw.get("page_count") or 1)
+        next_url = None
+        if page < page_count:
+            parts = urllib.parse.urlsplit(url)
+            query = dict(urllib.parse.parse_qsl(parts.query))
+            query["page"] = str(page + 1)
+            next_url = urllib.parse.urlunsplit(
+                parts._replace(query=urllib.parse.urlencode(query))
+            )
+        log.info("Openverse returned %s matches (%d in page)", raw.get("result_count"), len(results))
+        return {"count": raw.get("result_count", len(results)), "results": results, "next": next_url}
+
+    def preview_cache_path(self, sound: dict[str, Any], target_dir: Path | None = None) -> Path:
+        url = preview_url(sound)
+        suffix = extension_from_url(url, ".mp3")
+        filename = clean_filename(sound, suffix)
+        if target_dir is not None:
+            return target_dir / filename
+        return PREVIEW_CACHE_DIR / sound_id(sound) / filename
+
+    def ensure_preview_file(self, sound: dict[str, Any], target_dir: Path | None = None) -> Path:
+        url = preview_url(sound)
+        if not url:
+            raise RuntimeError("This sound has no audio URL.")
+        target = self.preview_cache_path(sound, target_dir)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target_dir is not None or not target.exists() or target.stat().st_size == 0:
+            log.info("Downloading Openverse audio %s -> %s", sound_id(sound), target)
+            target.write_bytes(auth_download_bytes(url))  # public CDN, no auth
+        return target
+
+    def download_waveform(self, sound: dict[str, Any]) -> Path:
+        peaks_url = sound.get("_waveform_url")
+        if not peaks_url:
+            raise RuntimeError("This sound has no waveform data.")
+        IMAGE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        target = IMAGE_CACHE_DIR / f"ov_{sound_id(sound)}_waveform.png"
+        if not target.exists() or target.stat().st_size == 0:
+            log.debug("Rendering Openverse waveform for sound %s", sound_id(sound))
+            raw = request_json(peaks_url, authorization=self._bearer())
+            render_waveform_png(raw.get("points") or [], target)
         return target
 
 
@@ -581,7 +829,13 @@ def run_ffmpeg_install(command: list[str]) -> str:
 
 
 def make_app_icon() -> QIcon:
-    """A simple placeholder icon: rounded card with a green-to-amber waveform."""
+    """The app logo (transparent PNG), falling back to a drawn placeholder."""
+    logo = RESOURCES_DIR / "icon.png"
+    if logo.exists():
+        icon = QIcon(str(logo))
+        if not icon.isNull():
+            return icon
+
     size = 256
     pixmap = QPixmap(size, size)
     pixmap.fill(Qt.transparent)
@@ -620,6 +874,28 @@ def make_app_icon() -> QIcon:
     return QIcon(pixmap)
 
 
+def make_settings_icon() -> QIcon:
+    size = 64
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+    painter.translate(size / 2, size / 2)
+
+    painter.setPen(Qt.NoPen)
+    painter.setBrush(QColor("#d8dee5"))
+    for _ in range(8):
+        painter.drawRoundedRect(QRect(-4, -28, 8, 12), 3, 3)
+        painter.rotate(45)
+
+    painter.setBrush(QColor("#d8dee5"))
+    painter.drawEllipse(QPoint(0, 0), 20, 20)
+    painter.setBrush(QColor("#272c33"))
+    painter.drawEllipse(QPoint(0, 0), 9, 9)
+    painter.end()
+    return QIcon(pixmap)
+
+
 class SettingsDialog(QDialog):
     def __init__(self, config: dict[str, Any], parent=None):
         super().__init__(parent)
@@ -634,9 +910,23 @@ class SettingsDialog(QDialog):
         dir_row.addWidget(self.download_dir, 1)
         dir_row.addWidget(browse)
 
+        self.ov_client_id = QLineEdit(config.get("openverse_client_id", ""))
+        self.ov_client_secret = QLineEdit(config.get("openverse_client_secret", ""))
+        self.ov_client_secret.setEchoMode(QLineEdit.Password)
+        ov_hint = QLabel(
+            'Optional — lifts Openverse\'s anonymous page-size/rate limit. '
+            'Register once at <a href="https://api.openverse.org/v1/#tag/auth">api.openverse.org</a> '
+            "(name, email → client ID/secret; confirm the email)."
+        )
+        ov_hint.setOpenExternalLinks(True)
+        ov_hint.setWordWrap(True)
+
         form = QFormLayout()
-        form.addRow("API key", self.api_key)
+        form.addRow("Freesound API key", self.api_key)
         form.addRow("Download folder", dir_row)
+        form.addRow("Openverse client ID", self.ov_client_id)
+        form.addRow("Openverse client secret", self.ov_client_secret)
+        form.addRow("", ov_hint)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
@@ -698,9 +988,12 @@ class SoundRowWidget(QWidget):
             ]
             if part
         )
-        stars = rating_stars(sound.get("avg_rating"))
         meta_html = f'<span style="color:#99a3ad">{info}</span>'
-        if stars:
+        source = source_label(sound)
+        stars = rating_stars(sound.get("avg_rating"))
+        if source:  # Openverse: show the provider instead of a (missing) rating
+            meta_html += f'&nbsp;&nbsp;<span style="color:#6cb6ff">{source}</span>'
+        elif stars:
             meta_html += f'&nbsp;&nbsp;<span style="color:#f0b429">{stars}</span>'
         meta = QLabel()
         meta.setObjectName("RowMeta")
@@ -987,6 +1280,18 @@ class FreesoundBrowser(QMainWindow):
         super().__init__()
         self.config = load_config()
         self.client = FreesoundClient(self.config["api_key"])
+        self.openverse = OpenverseClient(
+            self.config.get("openverse_client_id", ""),
+            self.config.get("openverse_client_secret", ""),
+        )
+        self.active_source = self.config.get("source", "freesound")
+        self.results_client = self.client
+        ovf = self.config.get("openverse_filters", {})
+        self.ov_sources = set(ovf.get("sources", OPENVERSE_DEFAULT_SOURCES))
+        self.ov_categories = set(ovf.get("categories", []))
+        self.ov_licenses = set(ovf.get("licenses", OPENVERSE_DEFAULT_LICENSES))
+        self.ov_modify = bool(ovf.get("modify", False))
+        self._ov_dirty = False
         self.store = LibraryStore(CONFIG_DIR)
         self.thread_pool = QThreadPool.globalInstance()
         self.thread_pool.setMaxThreadCount(8)
@@ -1005,6 +1310,9 @@ class FreesoundBrowser(QMainWindow):
         self.total_matches = 0
         self.loading_search = False
         self.loading_more = False
+        self.results_query = ""
+        self.library_filter = ""
+        self._syncing_query = False
         self.cached_preview_by_id: dict[str, Path] = {}
         self.cached_clip_by_key: dict[tuple[str, int, int], Path] = {}
         self.current_clip_file: Path | None = None
@@ -1041,14 +1349,11 @@ class FreesoundBrowser(QMainWindow):
             QTimer.singleShot(300, lambda: self.prompt_ffmpeg_install(force=False))
 
     def build_actions(self) -> None:
-        file_menu = self.menuBar().addMenu("File")
-        settings_action = QAction("Settings", self)
-        settings_action.triggered.connect(self.open_settings)
-        file_menu.addAction(settings_action)
+        self.settings_action = QAction("API key", self)
+        self.settings_action.triggered.connect(self.open_settings)
 
         self.install_ffmpeg_action = QAction("Install ffmpeg…", self)
         self.install_ffmpeg_action.triggered.connect(lambda: self.prompt_ffmpeg_install(force=True))
-        file_menu.addAction(self.install_ffmpeg_action)
 
     def build_ui(self) -> None:
         root = QWidget()
@@ -1059,11 +1364,6 @@ class FreesoundBrowser(QMainWindow):
         layout.setSpacing(12)
 
         self.search_bar = QWidget()
-        # Keep the search bar's vertical space reserved when it is hidden on the
-        # Library tab, so the tabs and detail panel below don't jump/resize.
-        search_policy = self.search_bar.sizePolicy()
-        search_policy.setRetainSizeWhenHidden(True)
-        self.search_bar.setSizePolicy(search_policy)
         header = QHBoxLayout(self.search_bar)
         header.setContentsMargins(0, 0, 0, 0)
         header.setSpacing(8)
@@ -1072,6 +1372,7 @@ class FreesoundBrowser(QMainWindow):
         self.query.setPlaceholderText("Search Freesound")
         self.query.setMinimumWidth(240)
         self.query.setMaximumWidth(520)
+        self.query.textChanged.connect(self.query_changed)
         self.query.returnPressed.connect(self.search)
         self.search_button = QPushButton("Search")
         self.search_button.setObjectName("PrimaryButton")
@@ -1089,28 +1390,68 @@ class FreesoundBrowser(QMainWindow):
         self.cc0_only.setToolTip("Show only Creative Commons 0 sounds.")
         self.cc0_only.toggled.connect(self.save_filter_config)
 
+        # Source selector (Freesound native vs Openverse aggregator).
+        self.source_combo = QComboBox()
+        self.source_combo.addItem("Freesound", "freesound")
+        self.source_combo.addItem("Openverse", "openverse")
+        idx = self.source_combo.findData(self.active_source)
+        self.source_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.source_combo.setToolTip("Search Freesound, or Openverse (Jamendo, Wikimedia, …).")
+        self.source_combo.currentIndexChanged.connect(self.source_changed)
+
+        # Openverse filter dropdowns (shown only in Openverse mode).
+        self.ov_filter_widgets: list[QWidget] = []
+        self.ov_quelle_btn = self._make_filter_button(
+            "Quelle", OPENVERSE_SOURCES, self.ov_sources, "sources")
+        self.ov_kategorie_btn = self._make_category_button()
+        self.ov_lizenz_btn = self._make_filter_button(
+            "Lizenzen", OPENVERSE_LICENSES, self.ov_licenses, "licenses")
+        self.ov_nutzung_btn = self._make_usage_button()
+        self.ov_filter_widgets = [
+            self.ov_quelle_btn, self.ov_kategorie_btn, self.ov_nutzung_btn, self.ov_lizenz_btn,
+        ]
+
+        self.settings_button = QToolButton()
+        self.settings_button.setObjectName("IconButton")
+        self.settings_button.setIcon(make_settings_icon())
+        self.settings_button.setIconSize(QSize(15, 15))
+        self.settings_button.setToolTip("Settings")
+        self.settings_button.setPopupMode(QToolButton.InstantPopup)
+        settings_menu = QMenu(self)
+        settings_menu.addAction(self.settings_action)
+        settings_menu.addAction(self.install_ffmpeg_action)
+        self.settings_button.setMenu(settings_menu)
+
         header.addWidget(self.query, 2)
         header.addWidget(self.search_button)
         header.addSpacing(8)
+        header.addWidget(self.source_combo)
         header.addWidget(sort_label)
         header.addWidget(self.sort_combo)
         header.addWidget(self.cc0_only)
+        for widget in self.ov_filter_widgets:
+            header.addWidget(widget)
         header.addStretch(1)
+        header.addWidget(self.settings_button)
         layout.addWidget(self.search_bar)
 
         self.status_label = QLabel("Ready")
         self.status_label.setObjectName("StatusLabel")
-        layout.addWidget(self.status_label)
+        self.status_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.status_label.setMinimumWidth(180)
+        self.status_label.setMaximumWidth(420)
 
         splitter = QSplitter(Qt.Horizontal)
         splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(10)
         layout.addWidget(splitter, 1)
 
         self.left_tabs = QTabWidget()
         self.left_tabs.setObjectName("LeftTabs")
+        self.left_tabs.setCornerWidget(self.status_label, Qt.TopRightCorner)
 
         results_panel = QFrame()
-        results_panel.setObjectName("Panel")
+        results_panel.setObjectName("ListPanel")
         list_layout = QVBoxLayout(results_panel)
         list_layout.setContentsMargins(0, 0, 0, 0)
         list_layout.setSpacing(0)
@@ -1126,7 +1467,7 @@ class FreesoundBrowser(QMainWindow):
         self.left_tabs.addTab(results_panel, "Results")
 
         library_panel = QFrame()
-        library_panel.setObjectName("Panel")
+        library_panel.setObjectName("ListPanel")
         library_layout = QVBoxLayout(library_panel)
         library_layout.setContentsMargins(10, 10, 10, 10)
         library_layout.setSpacing(8)
@@ -1242,7 +1583,12 @@ class FreesoundBrowser(QMainWindow):
             info_row.addWidget(pill, 1)
         detail_layout.addLayout(info_row)
 
-        splitter.addWidget(detail)
+        detail_host = QWidget()
+        detail_host_layout = QVBoxLayout(detail_host)
+        detail_host_layout.setContentsMargins(0, 34, 0, 0)
+        detail_host_layout.setSpacing(0)
+        detail_host_layout.addWidget(detail)
+        splitter.addWidget(detail_host)
         splitter.setStretchFactor(0, 5)
         splitter.setStretchFactor(1, 6)
         splitter.setSizes([560, 680])
@@ -1308,6 +1654,17 @@ class FreesoundBrowser(QMainWindow):
             QToolButton#CollectionButton:disabled {
                 color: #6f7680;
             }
+            QToolButton#IconButton {
+                padding: 2px;
+                min-width: 26px;
+                max-width: 26px;
+                min-height: 26px;
+                max-height: 28px;
+            }
+            QToolButton#IconButton::menu-indicator {
+                image: none;
+                width: 0;
+            }
             QToolButton#CollectionButton[saved="true"] {
                 background: #3a2f12;
                 border-color: #f0b429;
@@ -1331,7 +1688,7 @@ class FreesoundBrowser(QMainWindow):
             }
             QTabWidget::pane {
                 border: none;
-                top: -1px;
+                top: 0;
             }
             QTabBar::tab {
                 background: #1b2026;
@@ -1384,12 +1741,25 @@ class FreesoundBrowser(QMainWindow):
             }
             QLabel#StatusLabel {
                 color: #9aa4af;
-                padding-left: 2px;
+                padding: 0 8px 0 10px;
+            }
+            QSplitter::handle {
+                background: #151719;
+                border: none;
+            }
+            QSplitter::handle:horizontal {
+                width: 10px;
             }
             QFrame#Panel {
                 background: #101316;
                 border: 1px solid #2b3138;
                 border-radius: 8px;
+            }
+            QFrame#ListPanel {
+                background: #101316;
+                border: 1px solid #2b3138;
+                border-radius: 8px;
+                border-top-left-radius: 0;
             }
             QListWidget#ResultsList {
                 background: transparent;
@@ -1485,11 +1855,12 @@ class FreesoundBrowser(QMainWindow):
         self.play_button.setEnabled(can_play)
         self.next_button.setEnabled(True)
         self.refresh_library_sources()
+        self.update_header_mode()
         self.update_action_buttons()
 
     def set_busy(self, busy: bool, message: str = "") -> None:
         self.loading_search = busy
-        self.search_button.setEnabled(not busy)
+        self.search_button.setEnabled(not busy or self.is_library_tab())
         if message:
             self.status_label.setText(message)
 
@@ -1538,19 +1909,196 @@ class FreesoundBrowser(QMainWindow):
             return
         self.config["api_key"] = dialog.api_key.text().strip()
         self.config["download_dir"] = dialog.download_dir.text().strip() or str(DEFAULT_DOWNLOAD_DIR)
+        self.config["openverse_client_id"] = dialog.ov_client_id.text().strip()
+        self.config["openverse_client_secret"] = dialog.ov_client_secret.text().strip()
         self.config["page_size"] = DEFAULT_PAGE_SIZE
         save_config(self.config)
         self.client.update_api_key(self.config["api_key"])
+        self.openverse.set_credentials(
+            self.config["openverse_client_id"], self.config["openverse_client_secret"]
+        )
         log.info(
-            "Settings updated (api_key=%s, download_dir=%s)",
+            "Settings updated (api_key=%s, download_dir=%s, openverse_auth=%s)",
             "set" if self.config["api_key"] else "missing",
             self.config["download_dir"],
+            "set" if self.config["openverse_client_id"] else "anonymous",
         )
+
+    def is_library_tab(self) -> bool:
+        return hasattr(self, "left_tabs") and self.left_tabs.tabText(self.left_tabs.currentIndex()) == "Library"
+
+    def query_changed(self, text: str) -> None:
+        if self._syncing_query:
+            return
+        if self.is_library_tab():
+            self.library_filter = text.strip()
+            self.populate_library()
+            return
+        self.results_query = text
+
+    def update_header_mode(self) -> None:
+        is_library = self.is_library_tab()
+        self._syncing_query = True
+        try:
+            self.query.setText(self.library_filter if is_library else self.results_query)
+        finally:
+            self._syncing_query = False
+
+        is_openverse = self.active_source == "openverse"
+        placeholder = "Search Library" if is_library else ("Search Openverse" if is_openverse else "Search Freesound")
+        self.query.setPlaceholderText(placeholder)
+        self.search_button.setText("Filter" if is_library else "Search")
+        self.search_button.setEnabled(is_library or not self.loading_search)
+        self.source_combo.setVisible(not is_library)
+        # Freesound-only filters
+        self.sort_combo.setVisible(not is_library and not is_openverse)
+        self.cc0_only.setVisible(not is_library and not is_openverse)
+        for label in self.search_bar.findChildren(QLabel):
+            if label.objectName() == "FieldLabel":
+                label.setVisible(not is_library and not is_openverse)
+        # Openverse-only filters
+        for widget in self.ov_filter_widgets:
+            widget.setVisible(not is_library and is_openverse)
+
+    def _make_filter_button(self, text, options, selected_set, key) -> QToolButton:
+        button = QToolButton()
+        button.setObjectName("FilterButton")
+        button.setText(text)
+        button.setPopupMode(QToolButton.InstantPopup)
+        menu = QMenu(self)
+        for label, value in options:
+            action = menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(value in selected_set)
+            action.toggled.connect(lambda checked, v=value, k=key: self.ov_filter_changed(k, v, checked))
+        menu.aboutToHide.connect(self.apply_openverse_filters)
+        button.setMenu(menu)
+        return button
+
+    def _make_category_button(self) -> QToolButton:
+        # Category has an explicit "Ohne Kategorie (alle)" entry, because most
+        # Openverse audio is uncategorised — picking a category filters hard.
+        button = QToolButton()
+        button.setObjectName("FilterButton")
+        button.setText("Audio-Kategorie")
+        button.setPopupMode(QToolButton.InstantPopup)
+        menu = QMenu(self)
+        self.ov_all_categories_action = menu.addAction("Ohne Kategorie (alle)")
+        self.ov_all_categories_action.setCheckable(True)
+        self.ov_all_categories_action.setChecked(not self.ov_categories)
+        self.ov_all_categories_action.triggered.connect(self.ov_clear_categories)
+        menu.addSeparator()
+        self.ov_category_actions = {}
+        for label, value in OPENVERSE_CATEGORIES:
+            action = menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(value in self.ov_categories)
+            action.toggled.connect(lambda checked, v=value: self.ov_category_toggled(v, checked))
+            self.ov_category_actions[value] = action
+        menu.aboutToHide.connect(self.apply_openverse_filters)
+        button.setMenu(menu)
+        return button
+
+    def _sync_all_categories(self) -> None:
+        self.ov_all_categories_action.blockSignals(True)
+        self.ov_all_categories_action.setChecked(not self.ov_categories)
+        self.ov_all_categories_action.blockSignals(False)
+
+    def ov_clear_categories(self, _checked: bool) -> None:
+        # "Ohne Kategorie" always means: no category filter (broadest results).
+        self.ov_categories.clear()
+        for action in self.ov_category_actions.values():
+            action.blockSignals(True)
+            action.setChecked(False)
+            action.blockSignals(False)
+        self._sync_all_categories()
+        self._ov_dirty = True
+
+    def ov_category_toggled(self, value: str, checked: bool) -> None:
+        if checked:
+            self.ov_categories.add(value)
+        else:
+            self.ov_categories.discard(value)
+        self._sync_all_categories()
+        self._ov_dirty = True
+
+    def _make_usage_button(self) -> QToolButton:
+        button = QToolButton()
+        button.setObjectName("FilterButton")
+        button.setText("Nutzung")
+        button.setPopupMode(QToolButton.InstantPopup)
+        menu = QMenu(self)
+        commercial = menu.addAction("Kommerziell nutzen")
+        commercial.setCheckable(True)
+        commercial.setChecked(True)
+        commercial.setEnabled(False)  # enforced: all results must be commercially usable
+        modify = menu.addAction("Ändern oder anpassen")
+        modify.setCheckable(True)
+        modify.setChecked(self.ov_modify)
+        modify.toggled.connect(self.ov_modify_changed)
+        menu.aboutToHide.connect(self.apply_openverse_filters)
+        button.setMenu(menu)
+        return button
+
+    def ov_filter_changed(self, key: str, value: str, checked: bool) -> None:
+        target = {"sources": self.ov_sources, "categories": self.ov_categories, "licenses": self.ov_licenses}[key]
+        if checked:
+            target.add(value)
+        else:
+            target.discard(value)
+        self._ov_dirty = True
+
+    def ov_modify_changed(self, checked: bool) -> None:
+        self.ov_modify = bool(checked)
+        self._ov_dirty = True
+
+    def apply_openverse_filters(self) -> None:
+        if not self._ov_dirty:
+            return
+        self._ov_dirty = False
+        self.save_source_config()
+        if self.active_source == "openverse" and self.results_query.strip() and not self.is_library_tab():
+            self.search()
+
+    def openverse_filters(self) -> dict[str, Any]:
+        sources = sorted(self.ov_sources) or list(OPENVERSE_DEFAULT_SOURCES)
+        license_type = ["commercial"]
+        if self.ov_modify:
+            license_type.append("modification")
+        return {
+            "sources": sources,
+            "categories": sorted(self.ov_categories),
+            "licenses": sorted(self.ov_licenses),
+            "license_type": license_type,
+        }
+
+    def source_changed(self) -> None:
+        self.active_source = self.source_combo.currentData() or "freesound"
+        log.info("Search source changed to %s", self.active_source)
+        self.save_source_config()
+        self.update_header_mode()
+        if self.results_query.strip() and not self.is_library_tab():
+            self.search()
+
+    def save_source_config(self) -> None:
+        self.config["source"] = self.active_source
+        self.config["openverse_filters"] = {
+            "sources": sorted(self.ov_sources),
+            "categories": sorted(self.ov_categories),
+            "licenses": sorted(self.ov_licenses),
+            "modify": self.ov_modify,
+        }
+        save_config(self.config)
 
     def search(self) -> None:
         query = self.query.text().strip()
+        if self.is_library_tab():
+            self.library_filter = query
+            self.populate_library()
+            return
         if not query or self.loading_search:
             return
+        self.results_query = query
         self.save_filter_config()
         self.results.clear()
         self.sound_widgets.clear()
@@ -1562,13 +2110,25 @@ class FreesoundBrowser(QMainWindow):
         self.update_detail(None)
         self.update_action_buttons()
 
-        sort = self.current_sort()
+        if self.active_source == "openverse":
+            client = self.openverse
+            filters = self.openverse_filters()
+            message = "Searching Openverse…"
 
-        def do_search():
-            return self.client.search(query, self.cc0_only.isChecked(), DEFAULT_PAGE_SIZE, sort)
+            def do_search():
+                return client.search(query, filters, DEFAULT_PAGE_SIZE)
+        else:
+            client = self.client
+            cc0 = self.cc0_only.isChecked()
+            sort = self.current_sort()
+            message = "Searching Freesound..."
 
-        self.set_busy(True, "Searching Freesound...")
-        self.run_worker("Searching Freesound...", do_search, self.populate_results, done_handler=lambda: self.set_busy(False))
+            def do_search():
+                return client.search(query, cc0, DEFAULT_PAGE_SIZE, sort)
+
+        self.results_client = client
+        self.set_busy(True, message)
+        self.run_worker(message, do_search, self.populate_results, done_handler=lambda: self.set_busy(False))
 
     def current_sort(self) -> str:
         return self.sort_combo.currentData() or DEFAULT_SORT
@@ -1577,7 +2137,7 @@ class FreesoundBrowser(QMainWindow):
         self.config["sort"] = self.current_sort()
         save_config(self.config)
         log.info("Sort changed to %s", self.config["sort"])
-        if self.query.text().strip():
+        if not self.is_library_tab() and self.results_query.strip():
             self.search()
 
     def maybe_load_more(self, value: int) -> None:
@@ -1590,8 +2150,10 @@ class FreesoundBrowser(QMainWindow):
             return
         self.loading_more = True
 
+        client = self.results_client
+
         def do_load_more():
-            return self.client.fetch_url(self.next_url or "")
+            return client.fetch_more(self.next_url or "")
 
         self.run_worker("Loading more results...", do_load_more, self.append_results, done_handler=self.load_more_finished)
 
@@ -1622,9 +2184,16 @@ class FreesoundBrowser(QMainWindow):
         widget_map[sound_id(sound)] = widget
         self.queue_row_waveform(sound)
 
+    def provider_for(self, sound: dict[str, Any] | None):
+        if sound and sound.get("_provider") == "openverse":
+            return self.openverse
+        return self.client
+
     def queue_row_waveform(self, sound: dict[str, Any]) -> None:
+        provider = self.provider_for(sound)
+
         def do_waveform():
-            return sound_id(sound), self.client.download_waveform(sound)
+            return sound_id(sound), provider.download_waveform(sound)
 
         worker = FunctionWorker(do_waveform, label=f"waveform:{sound_id(sound)}")
         worker.signals.result.connect(self.set_row_waveform)
@@ -1657,7 +2226,7 @@ class FreesoundBrowser(QMainWindow):
 
     def on_tab_changed(self, index: int) -> None:
         is_library = self.left_tabs.tabText(index) == "Library"
-        self.search_bar.setVisible(not is_library)
+        self.update_header_mode()
         if is_library:
             self.active_list = self.library_list
             self.refresh_library_sources()
@@ -1699,17 +2268,36 @@ class FreesoundBrowser(QMainWindow):
             chip.setChecked(chip.property("sourceKey") == key)
         self.populate_library()
 
+    def library_filter_matches(self, sound: dict[str, Any], query: str) -> bool:
+        if not query:
+            return True
+        parts = [
+            str(sound.get("id", "")),
+            str(sound.get("name", "")),
+            str(sound.get("username", "")),
+            str(sound.get("type", "")),
+            str(sound.get("description", "")),
+            " ".join(str(tag) for tag in sound.get("tags") or []),
+        ]
+        haystack = " ".join(parts).lower()
+        return all(token in haystack for token in query.lower().split())
+
     def populate_library(self) -> None:
         self.library_list.blockSignals(True)
         self.library_list.clear()
         self.library_widgets.clear()
         source = self.library_source_key or HISTORY_KEY
         sounds = self.store.sounds_for(source)
-        for sound in sounds:
+        query = self.library_filter.strip()
+        visible_sounds = [sound for sound in sounds if self.library_filter_matches(sound, query)]
+        for sound in visible_sounds:
             self.add_sound_row(sound, self.library_list, self.library_widgets)
         self.library_list.blockSignals(False)
         label = "recently used" if source == HISTORY_KEY else f"'{source}'"
-        self.status_label.setText(f"{len(sounds)} sounds in {label}")
+        if query:
+            self.status_label.setText(f"{len(visible_sounds)} of {len(sounds)} sounds in {label}")
+        else:
+            self.status_label.setText(f"{len(sounds)} sounds in {label}")
 
     def record_current_use(self) -> None:
         if self.current_sound:
@@ -1772,16 +2360,27 @@ class FreesoundBrowser(QMainWindow):
         self.large_waveform.set_waveform(None)
 
     def metadata_text(self, sound: dict[str, Any]) -> str:
-        lines = [
-            sound.get("description", "") or "",
-            "",
-            f"Tags: {sound_tags(sound)}",
-            f"Downloads: {sound.get('num_downloads', '')}",
-            f"Rating: {sound.get('avg_rating', '')}",
-            f"Created: {sound.get('created', '')}",
-            f"URL: {sound.get('url', '')}",
-        ]
-        return "\n".join(line for line in lines if line is not None)
+        lines = [sound.get("description", "") or "", ""]
+        source = source_label(sound)
+        if source:
+            lines.append(f"Source: {source}")
+        if sound.get("_license"):
+            lines.append(f"License: {sound['_license']}")
+        tags = sound_tags(sound)
+        if tags:
+            lines.append(f"Tags: {tags}")
+        if sound.get("num_downloads"):
+            lines.append(f"Downloads: {sound['num_downloads']}")
+        try:
+            if float(sound.get("avg_rating") or 0) > 0:
+                lines.append(f"Rating: {sound['avg_rating']}")
+        except (TypeError, ValueError):
+            pass
+        if sound.get("created"):
+            lines.append(f"Created: {sound['created']}")
+        if sound.get("url"):
+            lines.append(f"URL: {sound['url']}")
+        return "\n".join(lines)
 
     def show_large_waveform(self, path: Path) -> None:
         self.current_waveform_file = Path(path)
@@ -1802,8 +2401,10 @@ class FreesoundBrowser(QMainWindow):
             self.current_preview_file = cached
             return
 
+        provider = self.provider_for(sound)
+
         def do_download():
-            return sid, self.client.ensure_preview_file(sound)
+            return sid, provider.ensure_preview_file(sound)
 
         worker = FunctionWorker(do_download, label=f"prefetch:{sid}")
         worker.signals.result.connect(self.preview_prefetched)
@@ -2127,14 +2728,16 @@ class FreesoundBrowser(QMainWindow):
                 result_handler(current)
                 return
 
+        provider = self.provider_for(sound)
+
         def do_download():
             source = self.cached_preview_by_id.get(sid)
             if not source or not source.exists():
-                source = self.client.ensure_preview_file(sound)
+                source = provider.ensure_preview_file(sound)
             if selection_is_full(self.selection_start, self.selection_end):
                 if target_dir is None:
                     return source
-                return self.client.ensure_preview_file(sound, target_dir)
+                return provider.ensure_preview_file(sound, target_dir)
             return trim_preview_file(source, sound, self.selection_start, self.selection_end, target_dir)
 
         self.run_worker("Preparing preview file...", do_download, result_handler)
@@ -2224,7 +2827,7 @@ def main() -> int:
         app = QApplication(sys.argv)
         app.setApplicationName(APP_NAME)
         app.setApplicationDisplayName(APP_NAME)
-        app.setDesktopFileName("resolve-freesound-browser")
+        app.setDesktopFileName("resolve-freesound-browser-wave")
         app.setWindowIcon(make_app_icon())
         window = FreesoundBrowser()
         window.show()
