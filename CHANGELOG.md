@@ -4,6 +4,8 @@ All notable changes from this point forward will be tracked here.
 
 ## Unreleased
 
+## 0.2.0 - 2026-07-06
+
 - Added Openverse as a second search source (Jamendo, Wikimedia Commons), selectable via a Source switcher; Freesound is excluded by default to avoid duplicates.
 - Added Openverse filters matching the site: Quelle (sources), Audio-Kategorie, Nutzung (commercial enforced), and Lizenzen (Public Domain Mark, CC0, CC BY); all optional and persisted.
 - Capped anonymous Openverse requests at page_size 20 (their limit) and added optional Openverse client ID/secret in settings for a bearer token that lifts the cap and rate limits.
