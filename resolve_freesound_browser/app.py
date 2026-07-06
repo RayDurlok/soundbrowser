@@ -15,7 +15,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from resolve_freesound_browser.logging_setup import LOGGER_NAME, install_excepthook, setup_logging
 from resolve_freesound_browser.store import HISTORY_KEY, LibraryStore
@@ -54,6 +54,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QPlainTextEdit,
     QSizePolicy,
@@ -138,10 +139,50 @@ IMAGE_CACHE_DIR = platform_cache_dir() / "images"
 PREVIEW_CACHE_DIR = platform_cache_dir() / "previews"
 CLIP_CACHE_DIR = platform_cache_dir() / "clips"
 LOG_DIR = platform_cache_dir() / "logs"
+LOG_PATH = LOG_DIR / "app.log"
 DEFAULT_DOWNLOAD_DIR = Path.home() / "Freesound Downloads"
 RESOURCES_DIR = Path(__file__).resolve().parents[1] / "resources"
 
 log = logging.getLogger(LOGGER_NAME)
+
+
+def display_path(path: str | Path | None) -> str:
+    if path is None:
+        return "<unset>"
+    value = str(path)
+    try:
+        home = str(Path.home())
+        if home and value == home:
+            return "~"
+        if home and value.startswith(home + os.sep):
+            return "~" + value[len(home):]
+    except Exception:
+        pass
+    return value
+
+
+def file_diagnostics(path: Path) -> dict[str, Any]:
+    info: dict[str, Any] = {
+        "path": display_path(path),
+        "exists": path.exists(),
+        "is_file": path.is_file(),
+        "suffix": path.suffix,
+    }
+    try:
+        info["absolute"] = display_path(path.resolve())
+    except Exception as exc:
+        info["resolve_error"] = repr(exc)
+    try:
+        stat = path.stat()
+        info["size"] = stat.st_size
+        info["mtime"] = int(stat.st_mtime)
+    except Exception as exc:
+        info["stat_error"] = repr(exc)
+    try:
+        info["readable"] = os.access(path, os.R_OK)
+    except Exception as exc:
+        info["access_error"] = repr(exc)
+    return info
 
 
 def load_config() -> dict[str, Any]:
@@ -237,7 +278,15 @@ def extension_from_url(url: str, fallback: str) -> str:
     return fallback
 
 
-def auth_download_bytes(url: str, api_key: str = "", authorization: str = "") -> bytes:
+ProgressCallback = Callable[[int, int | None], None]
+
+
+def auth_download_bytes(
+    url: str,
+    api_key: str = "",
+    authorization: str = "",
+    progress_callback: ProgressCallback | None = None,
+) -> bytes:
     headers = {"User-Agent": "ResolveFreesoundBrowser/0.2"}
     if authorization:
         headers["Authorization"] = authorization
@@ -248,7 +297,24 @@ def auth_download_bytes(url: str, api_key: str = "", authorization: str = "") ->
     started = time.perf_counter()
     try:
         with urllib.request.urlopen(request, timeout=60) as response:
-            data = response.read()
+            total_header = response.headers.get("Content-Length")
+            try:
+                total = int(total_header) if total_header else None
+            except ValueError:
+                total = None
+            chunks: list[bytes] = []
+            downloaded = 0
+            while True:
+                chunk = response.read(64 * 1024)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                downloaded += len(chunk)
+                if progress_callback:
+                    progress_callback(downloaded, total)
+            data = b"".join(chunks)
+            if progress_callback:
+                progress_callback(len(data), total or len(data))
     except urllib.error.HTTPError as exc:
         body = ""
         try:
@@ -423,6 +489,7 @@ def trim_preview_file(source: Path, sound: dict[str, Any], start_fraction: float
 
 class WorkerSignals(QObject):
     result = Signal(object)
+    progress = Signal(object)
     error = Signal(str)
     finished = Signal()
 
@@ -486,7 +553,12 @@ class FreesoundClient:
         # Cache: keep the clean drag/drop name, get uniqueness from the id folder.
         return PREVIEW_CACHE_DIR / sound_id(sound) / filename
 
-    def ensure_preview_file(self, sound: dict[str, Any], target_dir: Path | None = None) -> Path:
+    def ensure_preview_file(
+        self,
+        sound: dict[str, Any],
+        target_dir: Path | None = None,
+        progress_callback: ProgressCallback | None = None,
+    ) -> Path:
         url = preview_url(sound)
         if not url:
             raise RuntimeError("This sound has no preview URL.")
@@ -495,10 +567,10 @@ class FreesoundClient:
         if target_dir is not None:
             # Download folder: always write a fresh, cleanly-named copy.
             log.info("Downloading preview for sound %s -> %s", sound_id(sound), target)
-            target.write_bytes(auth_download_bytes(url, self.api_key))
+            target.write_bytes(auth_download_bytes(url, self.api_key, progress_callback=progress_callback))
         elif not target.exists() or target.stat().st_size == 0:
             log.info("Downloading preview for sound %s -> %s", sound_id(sound), target)
-            target.write_bytes(auth_download_bytes(url, self.api_key))
+            target.write_bytes(auth_download_bytes(url, self.api_key, progress_callback=progress_callback))
         else:
             log.debug("Preview cache hit for sound %s (%s)", sound_id(sound), target)
         return target
@@ -715,7 +787,12 @@ class OpenverseClient:
             return target_dir / filename
         return PREVIEW_CACHE_DIR / sound_id(sound) / filename
 
-    def ensure_preview_file(self, sound: dict[str, Any], target_dir: Path | None = None) -> Path:
+    def ensure_preview_file(
+        self,
+        sound: dict[str, Any],
+        target_dir: Path | None = None,
+        progress_callback: ProgressCallback | None = None,
+    ) -> Path:
         url = preview_url(sound)
         if not url:
             raise RuntimeError("This sound has no audio URL.")
@@ -723,7 +800,7 @@ class OpenverseClient:
         target.parent.mkdir(parents=True, exist_ok=True)
         if target_dir is not None or not target.exists() or target.stat().st_size == 0:
             log.info("Downloading Openverse audio %s -> %s", sound_id(sound), target)
-            target.write_bytes(auth_download_bytes(url))  # public CDN, no auth
+            target.write_bytes(auth_download_bytes(url, progress_callback=progress_callback))  # public CDN, no auth
         return target
 
     def download_waveform(self, sound: dict[str, Any]) -> Path:
@@ -767,11 +844,25 @@ def resolve_module_candidates() -> list[Path]:
 
 
 def get_resolve():
-    for module_dir in resolve_module_candidates():
+    candidates = resolve_module_candidates()
+    log.info(
+        "Resolve scripting lookup started (platform=%s, candidates=%s)",
+        sys.platform,
+        [display_path(path) for path in candidates],
+    )
+    found_module = False
+    for module_dir in candidates:
         module_path = module_dir / "DaVinciResolveScript.py"
+        exists = module_path.exists()
+        log.debug("Resolve scripting candidate: %s exists=%s", display_path(module_path), exists)
         if module_path.exists() and str(module_dir) not in sys.path:
             log.debug("Using Resolve scripting module at %s", module_dir)
             sys.path.insert(0, str(module_dir))
+            found_module = True
+        elif exists:
+            found_module = True
+    if not found_module:
+        log.warning("No DaVinciResolveScript.py found in known module locations.")
 
     if sys.platform.startswith("linux"):
         os.environ.setdefault("RESOLVE_SCRIPT_API", "/opt/resolve/Developer/Scripting")
@@ -796,29 +887,81 @@ def get_resolve():
             "C:\\Program Files\\Blackmagic Design\\DaVinci Resolve\\fusionscript.dll",
         )
 
+    log.debug(
+        "Resolve env: RESOLVE_SCRIPT_API=%s RESOLVE_SCRIPT_LIB=%s",
+        display_path(os.environ.get("RESOLVE_SCRIPT_API")),
+        display_path(os.environ.get("RESOLVE_SCRIPT_LIB")),
+    )
     module = importlib.import_module("DaVinciResolveScript")
-    return module.scriptapp("Resolve")
+    log.debug("Imported DaVinciResolveScript module from %s", display_path(getattr(module, "__file__", None)))
+    resolve = module.scriptapp("Resolve")
+    log.info("Resolve scriptapp returned %s", type(resolve).__name__ if resolve else None)
+    return resolve
 
 
 def import_into_resolve(paths: list[Path]) -> int:
-    log.info("Importing %d file(s) into Resolve: %s", len(paths), [str(p) for p in paths])
+    started = time.perf_counter()
+    log.info("Resolve import requested for %d file(s).", len(paths))
+    for path in paths:
+        log.info("Resolve import file diagnostics: %s", file_diagnostics(Path(path)))
     try:
         resolve = get_resolve()
-    except Exception:
+    except Exception as exc:
         log.exception("Failed to load Resolve scripting module")
-        raise RuntimeError("Could not load the Resolve scripting module. Is Resolve installed?")
+        raise RuntimeError(f"Could not load the Resolve scripting module. Is Resolve installed? ({exc})") from exc
     if not resolve:
+        log.error("Resolve scriptapp returned no Resolve object.")
         raise RuntimeError("Could not connect to Resolve. Is Resolve running with scripting enabled?")
-    project_manager = resolve.GetProjectManager()
-    project = project_manager.GetCurrentProject() if project_manager else None
+    try:
+        project_manager = resolve.GetProjectManager()
+        log.info("Resolve project manager: %s", type(project_manager).__name__ if project_manager else None)
+    except Exception as exc:
+        log.exception("Resolve.GetProjectManager failed")
+        raise RuntimeError(f"Resolve.GetProjectManager failed: {exc}") from exc
+    try:
+        project = project_manager.GetCurrentProject() if project_manager else None
+        log.info("Resolve current project: %s", type(project).__name__ if project else None)
+    except Exception as exc:
+        log.exception("Resolve.GetCurrentProject failed")
+        raise RuntimeError(f"Resolve.GetCurrentProject failed: {exc}") from exc
     if not project:
+        log.error("Resolve has no current project.")
         raise RuntimeError("Resolve has no current project.")
-    media_pool = project.GetMediaPool()
-    imported = media_pool.ImportMedia([str(path) for path in paths])
+    try:
+        project_name = project.GetName() if hasattr(project, "GetName") else None
+        log.info("Resolve project name: %r", project_name)
+    except Exception:
+        log.debug("Could not read Resolve project name", exc_info=True)
+    try:
+        media_pool = project.GetMediaPool()
+        log.info("Resolve media pool: %s", type(media_pool).__name__ if media_pool else None)
+    except Exception as exc:
+        log.exception("Resolve.GetMediaPool failed")
+        raise RuntimeError(f"Resolve.GetMediaPool failed: {exc}") from exc
+    if not media_pool:
+        log.error("Resolve project returned no MediaPool object.")
+        raise RuntimeError("Resolve project returned no MediaPool object.")
+    path_strings = [str(Path(path)) for path in paths]
+    try:
+        log.info("Calling MediaPool.ImportMedia with %s", [display_path(path) for path in path_strings])
+        imported = media_pool.ImportMedia(path_strings)
+        log.info(
+            "MediaPool.ImportMedia returned %r after %.0f ms",
+            imported,
+            (time.perf_counter() - started) * 1000,
+        )
+    except Exception as exc:
+        log.exception("MediaPool.ImportMedia raised an exception")
+        raise RuntimeError(f"Resolve ImportMedia failed: {exc}") from exc
     if not imported:
+        log.error("Resolve ImportMedia returned an empty/false result for %s", [display_path(path) for path in path_strings])
         raise RuntimeError("Resolve did not import the selected file.")
-    log.info("Resolve imported %d file(s)", len(imported))
-    return len(imported)
+    try:
+        imported_count = len(imported)
+    except TypeError:
+        imported_count = 1
+    log.info("Resolve imported %d file(s)", imported_count)
+    return imported_count
 
 
 def ffmpeg_available() -> bool:
@@ -1368,6 +1511,7 @@ class FreesoundBrowser(QMainWindow):
         self._pending_seek_ms = 0
         self._apply_seek = False
         self._pending_play: tuple[str, float] | None = None
+        self.drag_download_progress: tuple[str, int | None] | None = None
 
         self.player = None
         self.audio_output = None
@@ -1400,6 +1544,9 @@ class FreesoundBrowser(QMainWindow):
 
         self.download_folder_action = QAction("Download folder…", self)
         self.download_folder_action.triggered.connect(self.choose_download_folder)
+
+        self.view_log_action = QAction("View log…", self)
+        self.view_log_action.triggered.connect(self.show_log_dialog)
 
         self.install_ffmpeg_action = QAction("Install ffmpeg…", self)
         self.install_ffmpeg_action.triggered.connect(lambda: self.prompt_ffmpeg_install(force=True))
@@ -1469,6 +1616,7 @@ class FreesoundBrowser(QMainWindow):
         settings_menu = QMenu(self)
         settings_menu.addAction(self.settings_action)
         settings_menu.addAction(self.download_folder_action)
+        settings_menu.addAction(self.view_log_action)
         settings_menu.addAction(self.install_ffmpeg_action)
         self.settings_button.setMenu(settings_menu)
 
@@ -1613,6 +1761,12 @@ class FreesoundBrowser(QMainWindow):
         ]:
             button.setFixedWidth(52 if button is self.collection_button else 42)
             controls.addWidget(button)
+        self.drag_ready_label = QProgressBar()
+        self.drag_ready_label.setObjectName("DragReadyProgress")
+        self.drag_ready_label.setTextVisible(True)
+        self.drag_ready_label.setFixedWidth(88)
+        self.drag_ready_label.setFixedHeight(20)
+        controls.addWidget(self.drag_ready_label)
         controls.addStretch(1)
         controls.addWidget(QLabel("Volume"))
         controls.addWidget(self.volume)
@@ -1796,6 +1950,46 @@ class FreesoundBrowser(QMainWindow):
                 color: #9aa4af;
                 padding: 0 8px 0 10px;
             }
+            QProgressBar#DragReadyProgress {
+                background: #24282d;
+                border: 1px solid #343b44;
+                border-radius: 4px;
+                color: #c9d1d9;
+                font-size: 11px;
+                font-weight: 600;
+                text-align: center;
+            }
+            QProgressBar#DragReadyProgress::chunk {
+                background: transparent;
+                border-radius: 3px;
+            }
+            QProgressBar#DragReadyProgress[state="ready"] {
+                background: #183020;
+                border-color: #2ea043;
+                color: #9be9a8;
+            }
+            QProgressBar#DragReadyProgress[state="ready"]::chunk {
+                background: rgba(46, 160, 67, 150);
+                border-radius: 3px;
+            }
+            QProgressBar#DragReadyProgress[state="pending"] {
+                background: #302812;
+                border-color: #8a6d1f;
+                color: #ffd866;
+            }
+            QProgressBar#DragReadyProgress[state="pending"]::chunk {
+                background: rgba(210, 153, 34, 145);
+                border-radius: 3px;
+            }
+            QProgressBar#DragReadyProgress[state="error"] {
+                background: #3a1717;
+                border-color: #b42323;
+                color: #ffb4b4;
+            }
+            QProgressBar#DragReadyProgress[state="error"]::chunk {
+                background: #b42323;
+                border-radius: 3px;
+            }
             QSplitter::handle {
                 background: #151719;
                 border: none;
@@ -1936,7 +2130,11 @@ class FreesoundBrowser(QMainWindow):
 
     def show_worker_error(self, message: str) -> None:
         log.warning("Surfaced error to user: %s", message)
-        QMessageBox.warning(self, APP_NAME, message)
+        QMessageBox.warning(
+            self,
+            APP_NAME,
+            f"{message}\n\nDetails were written to:\n{display_path(LOG_PATH)}",
+        )
         self.status_label.setText(message)
 
     def save_filter_config(self) -> None:
@@ -1965,6 +2163,37 @@ class FreesoundBrowser(QMainWindow):
         save_config(self.config)
         self.status_label.setText(f"Download folder: {selected}")
         log.info("Download folder set to %s", selected)
+
+    def show_log_dialog(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Resolve Freesound Browser Log")
+        dialog.resize(980, 640)
+        layout = QVBoxLayout(dialog)
+
+        path_label = QLabel(display_path(LOG_PATH))
+        path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        layout.addWidget(path_label)
+
+        viewer = QPlainTextEdit()
+        viewer.setReadOnly(True)
+        viewer.setLineWrapMode(QPlainTextEdit.NoWrap)
+        try:
+            text = LOG_PATH.read_text(encoding="utf-8", errors="replace")
+        except FileNotFoundError:
+            text = "No log file exists yet."
+        except Exception as exc:
+            text = f"Could not read log file:\n{exc}"
+        lines = text.splitlines()
+        if len(lines) > 1200:
+            text = "\n".join(["... showing last 1200 log lines ...", *lines[-1200:]])
+        viewer.setPlainText(text)
+        viewer.verticalScrollBar().setValue(viewer.verticalScrollBar().maximum())
+        layout.addWidget(viewer, 1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        dialog.exec()
 
     def open_settings(self) -> None:
         dialog = SettingsDialog(self.config, self)
@@ -2378,6 +2607,7 @@ class FreesoundBrowser(QMainWindow):
         self.current_sound = sound
         self.current_preview_file = None
         self.current_clip_file = None
+        self.drag_download_progress = None
         self.selection_start = 0.0
         self.selection_end = 1.0
         self.manual_start_fraction = None
@@ -2465,17 +2695,35 @@ class FreesoundBrowser(QMainWindow):
             return
 
         provider = self.provider_for(sound)
+        progress_emit: dict[str, Callable[[int, int | None], None]] = {}
 
         def do_download():
-            return sid, provider.ensure_preview_file(sound)
+            return sid, provider.ensure_preview_file(
+                sound,
+                progress_callback=progress_emit["emit"],
+            )
 
         worker = FunctionWorker(do_download, label=f"prefetch:{sid}")
+        progress_emit["emit"] = lambda downloaded, total: worker.signals.progress.emit((sid, downloaded, total))
+        worker.signals.progress.connect(self.preview_download_progress)
         worker.signals.result.connect(self.preview_prefetched)
         worker.signals.error.connect(self.preview_prefetch_failed)
         self.start_worker(worker)
+        self.update_drag_ready_label()
+
+    def preview_download_progress(self, payload) -> None:
+        sid, downloaded, total = payload
+        if not self.current_sound or sound_id(self.current_sound) != sid:
+            return
+        percent = None
+        if total:
+            percent = max(0, min(100, int(downloaded * 100 / total)))
+        self.drag_download_progress = (sid, percent)
+        self.update_drag_ready_label()
 
     def preview_prefetch_failed(self, message: str) -> None:
         log.warning("Preview prefetch failed: %s", message)
+        self.drag_download_progress = None
         if self._pending_play:
             sid, start_fraction = self._pending_play
             self._pending_play = None
@@ -2491,6 +2739,7 @@ class FreesoundBrowser(QMainWindow):
         path = Path(path)
         self.cached_preview_by_id[sid] = path
         if self.current_sound and sound_id(self.current_sound) == sid:
+            self.drag_download_progress = None
             self.current_preview_file = path
             self.prepare_selection_clip()
             self.update_action_buttons()
@@ -2507,6 +2756,52 @@ class FreesoundBrowser(QMainWindow):
         self.import_button.setEnabled(has_sound)
         self.open_button.setEnabled(has_sound)
         self.update_collection_button()
+        self.update_drag_ready_label()
+
+    def drag_ready_state(self) -> tuple[str, str, str]:
+        sound = self.current_sound
+        if not sound:
+            return "Drag", "idle", "Drag status: select a sound first."
+        drag_file = self.current_drag_file()
+        if drag_file and Path(drag_file).exists():
+            return "Ready", "ready", f"Drag status: ready ({Path(drag_file).name})"
+        if not preview_url(sound):
+            return "No file", "error", "Drag status: no preview file available."
+        if not self.current_preview_file or not self.current_preview_file.exists():
+            return "Loading…", "pending", "Drag status: downloading preview."
+        if not selection_is_full(self.selection_start, self.selection_end):
+            return "Trim", "pending", "Drag status: preparing trimmed In/Out clip."
+        return "Wait", "pending", "Drag status: preparing local file."
+
+    def update_drag_ready_label(self) -> None:
+        if not hasattr(self, "drag_ready_label"):
+            return
+        text, state, tooltip = self.drag_ready_state()
+        if state == "pending":
+            percent = None
+            if self.current_sound and self.drag_download_progress:
+                sid, current_percent = self.drag_download_progress
+                if sid == sound_id(self.current_sound):
+                    percent = current_percent
+            if percent is None:
+                self.drag_ready_label.setRange(0, 0)
+            else:
+                self.drag_ready_label.setRange(0, 100)
+                self.drag_ready_label.setValue(percent)
+        elif state == "ready":
+            self.drag_ready_label.setRange(0, 100)
+            self.drag_ready_label.setValue(100)
+        elif state == "error":
+            self.drag_ready_label.setRange(0, 100)
+            self.drag_ready_label.setValue(100)
+        else:
+            self.drag_ready_label.setRange(0, 100)
+            self.drag_ready_label.setValue(0)
+        self.drag_ready_label.setFormat(text)
+        self.drag_ready_label.setProperty("state", state)
+        self.drag_ready_label.setToolTip(tooltip)
+        self.drag_ready_label.style().unpolish(self.drag_ready_label)
+        self.drag_ready_label.style().polish(self.drag_ready_label)
 
     # ----- collections -------------------------------------------------
     def update_collection_button(self) -> None:
@@ -2659,10 +2954,15 @@ class FreesoundBrowser(QMainWindow):
         def do_trim():
             return key, trim_preview_file(source, sound, start, end)
 
+        def trim_failed(message: str) -> None:
+            self.status_label.setText(message)
+            self.update_drag_ready_label()
+
         worker = FunctionWorker(do_trim)
         worker.signals.result.connect(self.selection_clip_ready)
-        worker.signals.error.connect(lambda message: self.status_label.setText(message))
+        worker.signals.error.connect(trim_failed)
         self.start_worker(worker)
+        self.update_drag_ready_label()
 
     def selection_clip_ready(self, payload) -> None:
         key, path = payload
@@ -2839,11 +3139,23 @@ class FreesoundBrowser(QMainWindow):
         self.status_label.setText(f"Downloaded: {downloaded}")
 
     def import_selected_to_resolve(self) -> None:
+        sound = self.selected_sound()
+        log.info(
+            "Import button pressed (sound_id=%s, provider=%s, selection=%.3f-%.3f, "
+            "preview=%s, clip=%s)",
+            sound_id(sound) if sound else None,
+            sound.get("_provider", "freesound") if sound else None,
+            self.selection_start,
+            self.selection_end,
+            display_path(self.current_preview_file),
+            display_path(self.current_clip_file),
+        )
         self.record_current_use()
         self.ensure_preview_file(self.import_preview_file)
 
     def import_preview_file(self, path: Path) -> None:
         path = Path(path)
+        log.info("Prepared Resolve import file: %s", file_diagnostics(path))
 
         def do_import():
             return import_into_resolve([path])
