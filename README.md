@@ -49,7 +49,7 @@ Client secret / Api key
 Then open the app and set it via:
 
 ```text
-File -> Settings -> API key
+Gear button -> API key
 ```
 
 You can also provide it for one run:
@@ -120,6 +120,67 @@ python3 -m pip install --user -r requirements.txt
 ./install_linux_user.sh
 ```
 
+## macOS Install
+
+Install Python 3 and ffmpeg first. Homebrew is the easiest route:
+
+```bash
+brew install python ffmpeg
+```
+
+From the project folder, create a local virtual environment and run the app:
+
+```bash
+cd ~/Apps/ResolveFreesoundBrowser
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+python run.py
+```
+
+You can also start it later with:
+
+```bash
+cd ~/Apps/ResolveFreesoundBrowser
+source .venv/bin/activate
+python run.py
+```
+
+Resolve import on macOS requires Resolve scripting to be enabled:
+
+```text
+Preferences -> System -> General -> External scripting using: Local
+```
+
+The app uses DaVinci Resolve's standard macOS scripting paths:
+
+```text
+/Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting
+/Applications/DaVinci Resolve/DaVinci Resolve.app/Contents/Libraries/Fusion/fusionscript.so
+```
+
+## macOS Update
+
+If this folder is a Git checkout:
+
+```bash
+cd ~/Apps/ResolveFreesoundBrowser
+git pull --ff-only
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+python run.py
+```
+
+If the virtual environment does not exist yet:
+
+```bash
+cd ~/Apps/ResolveFreesoundBrowser
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+python run.py
+```
+
 ## Windows Run
 
 Install Python 3 and then, from the project folder:
@@ -175,6 +236,12 @@ Windows:
 
 - Config: `%APPDATA%\Resolve Freesound Browser\config.json`
 - Cache/logs: `%LOCALAPPDATA%\Resolve Freesound Browser\Cache\`
+
+macOS:
+
+- Config: `~/Library/Application Support/Resolve Freesound Browser/config.json`
+- Library/history: `~/Library/Application Support/Resolve Freesound Browser/history.json` and `collections.json`
+- Cache/logs: `~/Library/Caches/Resolve Freesound Browser/`
 
 ## Logging
 
