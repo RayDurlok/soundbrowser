@@ -17,6 +17,7 @@ normal file drag/drop plus optional Resolve scripting import.
 - API-key authentication for search, preview access, waveform images, and metadata
 - Sort modes: relevance, rating, most downloaded, newest, duration
 - Source, license, category, usage, and length filters
+- Optional filter to hide language files whose name starts with `LL`
 - Infinite scroll / automatic result loading
 - Modern dark UI with result waveforms and rating stars
 - Preview playback with play/pause, next, volume, click-to-seek, and playhead
@@ -100,36 +101,46 @@ python3 -m pip install --user -r requirements.txt
 
 ## macOS Install
 
-Install Python 3 and ffmpeg first. Homebrew is the easiest route:
-
-```bash
-brew install python ffmpeg
-```
-
 Recommended install/update command. It downloads the latest GitHub release into
 `~/Apps/ResolveFreesoundBrowser`, creates/updates the local virtual environment,
-and prints the start command:
+creates a normal app in `~/Applications`, installs the Resolve menu launcher,
+and installs all required Homebrew dependencies. If Homebrew is missing, its
+official installer is started first:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/RayDurlok/soundbrowser/main/install_latest_macos.sh | bash
 ```
 
+The installer creates:
+
+- `~/Applications/Resolve Freesound Browser.app`
+- `~/.local/bin/resolve-freesound-browser`
+- `~/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Edit/Resolve Freesound Browser.py`
+
+Open the app from Finder, Spotlight, or Launchpad. Inside Resolve it appears at:
+
+```text
+Workspace -> Scripts -> Edit -> Resolve Freesound Browser
+```
+
+If Resolve was open during installation, restart it once so it discovers the
+new Scripts menu entry.
+
 Manual install from an already downloaded project folder:
 
 ```bash
+brew install python ffmpeg
 cd ~/Apps/ResolveFreesoundBrowser
-python3 -m venv .venv
+"$(brew --prefix python)/bin/python3" -m venv .venv
 source .venv/bin/activate
-python -m pip install -r requirements.txt
-python run.py
+python -m pip install --upgrade -r requirements.txt
+./install_macos_user.sh
 ```
 
-You can also start it later with:
+If Homebrew itself is not installed, use its official installation command:
 
 ```bash
-cd ~/Apps/ResolveFreesoundBrowser
-source .venv/bin/activate
-python run.py
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 ```
 
 Resolve import on macOS requires Resolve scripting to be enabled:
@@ -147,7 +158,9 @@ The app uses DaVinci Resolve's standard macOS scripting paths:
 
 ## macOS Update
 
-Run the same latest-release installer again:
+Run the same installer again. It updates the venv, `.app`, and Resolve launcher.
+Local changes inside the app checkout are saved to a named Git stash before the
+release is switched, and the installer prints the command to restore them:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/RayDurlok/soundbrowser/main/install_latest_macos.sh | bash
@@ -158,13 +171,25 @@ If this folder is a Git checkout and you prefer manual control:
 ```bash
 cd ~/Apps/ResolveFreesoundBrowser
 latest_tag=$(curl -fsSL https://api.github.com/repos/RayDurlok/soundbrowser/releases/latest | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')
+git stash push --include-untracked -m "before-manual-update"
 git fetch --tags --prune origin
 git checkout --detach "$latest_tag"
-python3 -m venv .venv
+"$(brew --prefix python)/bin/python3" -m venv .venv
 source .venv/bin/activate
-python -m pip install -r requirements.txt
-python run.py
+python -m pip install --upgrade -r requirements.txt
+./install_macos_user.sh
 ```
+
+## macOS Uninstall
+
+Remove the `.app`, command launcher, and Resolve Scripts menu entry:
+
+```bash
+cd ~/Apps/ResolveFreesoundBrowser
+./uninstall_macos_user.sh
+```
+
+The repository checkout, settings, downloads, and cache are intentionally kept.
 
 ## Windows Run
 

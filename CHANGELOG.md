@@ -4,6 +4,16 @@ All notable changes from this point forward will be tracked here.
 
 ## Unreleased
 
+## 0.3.2 - 2026-07-20
+
+- Added keyboard shortcuts for the selected sound: Space toggles play/pause, I sets the In point, and O sets the Out point at the current cursor position.
+- Added an `Exclude LL` result toggle to hide language files whose name starts with `LL`.
+- Preview playback now starts immediately from the remote stream while the local cached drag/import file continues downloading in the background.
+- Fixed the Python 3.9 startup crash caused by a runtime-only Python 3.10 union type.
+- Added a complete macOS installer with Homebrew dependencies, a user `.app`, a command launcher, and the Resolve Scripts menu entry.
+- macOS updates now preserve local checkout changes in a named Git stash before switching releases.
+- Added a macOS integration uninstaller and Python 3.9/3.13 compatibility checks.
+
 ## 0.3.1 - 2026-07-06
 
 - Added a Cache settings dialog with age retention and maximum cache size limits.

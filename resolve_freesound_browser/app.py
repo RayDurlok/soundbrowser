@@ -16,7 +16,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 from resolve_freesound_browser.logging_setup import LOGGER_NAME, install_excepthook, setup_logging
 from resolve_freesound_browser.store import HISTORY_KEY, LibraryStore
@@ -24,6 +24,7 @@ from resolve_freesound_browser.store import HISTORY_KEY, LibraryStore
 from PySide6.QtCore import (
     QAbstractAnimation,
     QEasingCurve,
+    QEvent,
     QMimeData,
     QObject,
     QPoint,
@@ -219,6 +220,7 @@ def load_config() -> dict[str, Any]:
         "openverse_client_id": "",
         "openverse_client_secret": "",
         "cache_policy": dict(DEFAULT_CACHE_POLICY),
+        "exclude_ll_language_files": True,
     }
     try:
         data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
@@ -419,7 +421,9 @@ def extension_from_url(url: str, fallback: str) -> str:
     return fallback
 
 
-ProgressCallback = Callable[[int, int | None], None]
+# This alias is evaluated at import time. Optional keeps it compatible with
+# Python 3.9, where ``int | None`` is not supported in runtime expressions.
+ProgressCallback = Callable[[int, Optional[int]], None]
 
 
 def auth_download_bytes(
@@ -489,6 +493,10 @@ def sound_duration_seconds(sound: dict[str, Any]) -> float:
         return max(0.0, float(sound.get("duration") or 0.0))
     except (TypeError, ValueError):
         return 0.0
+
+
+def is_ll_language_file(sound: dict[str, Any]) -> bool:
+    return str(sound.get("name", "")).lstrip().upper().startswith("LL")
 
 
 AUDIO_NAME_EXTS = {
@@ -1784,6 +1792,7 @@ class FreesoundBrowser(QMainWindow):
         # Duration range filter in seconds (0 = unbounded).
         self.length_min = max(0, int(ovf.get("length_min", 0) or 0))
         self.length_max = max(0, int(ovf.get("length_max", 0) or 0))
+        self.exclude_ll_language_files = bool(self.config.get("exclude_ll_language_files", True))
         self._ov_dirty = False
         # Multi-source merge/pagination state.
         self.source_next: dict[str, str | None] = {}
@@ -1844,6 +1853,9 @@ class FreesoundBrowser(QMainWindow):
         self.build_actions()
         self.build_ui()
         self.apply_config_to_ui()
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
         QTimer.singleShot(1200, self.cleanup_cache_auto)
         if not ffmpeg_available():
             QTimer.singleShot(300, lambda: self.prompt_ffmpeg_install(force=False))
@@ -1905,9 +1917,12 @@ class FreesoundBrowser(QMainWindow):
             "Lizenzen", OPENVERSE_LICENSES, self.ov_licenses, "licenses")
         self.ov_nutzung_btn = self._make_usage_button()
         self.length_btn = self._make_length_button()
+        self.exclude_ll_check = QCheckBox("Exclude LL")
+        self.exclude_ll_check.setToolTip("Hide sounds whose filename starts with LL.")
+        self.exclude_ll_check.toggled.connect(self.exclude_ll_changed)
         self.ov_filter_widgets = [
             self.ov_quelle_btn, self.ov_kategorie_btn, self.ov_nutzung_btn,
-            self.ov_lizenz_btn, self.length_btn,
+            self.ov_lizenz_btn, self.length_btn, self.exclude_ll_check,
         ]
         self.sort_widgets = [sort_label, self.sort_combo]
 
@@ -1933,6 +1948,7 @@ class FreesoundBrowser(QMainWindow):
         header.addWidget(self.ov_nutzung_btn)
         header.addWidget(self.ov_lizenz_btn)
         header.addWidget(self.length_btn)
+        header.addWidget(self.exclude_ll_check)
         header.addSpacing(8)
         header.addWidget(sort_label)
         header.addWidget(self.sort_combo)
@@ -2415,6 +2431,9 @@ class FreesoundBrowser(QMainWindow):
             self.sort_combo.blockSignals(True)
             self.sort_combo.setCurrentIndex(index)
             self.sort_combo.blockSignals(False)
+        self.exclude_ll_check.blockSignals(True)
+        self.exclude_ll_check.setChecked(self.exclude_ll_language_files)
+        self.exclude_ll_check.blockSignals(False)
         can_play = self.player is not None
         self.play_button.setEnabled(can_play)
         self.next_button.setEnabled(True)
@@ -2456,6 +2475,7 @@ class FreesoundBrowser(QMainWindow):
 
     def save_filter_config(self) -> None:
         self.config["page_size"] = DEFAULT_PAGE_SIZE
+        self.config["exclude_ll_language_files"] = self.exclude_ll_language_files
         save_config(self.config)
 
     def set_volume(self, value: int) -> None:
@@ -2521,6 +2541,32 @@ class FreesoundBrowser(QMainWindow):
             )
         else:
             self.status_label.setText(f"Cache settings saved. Cache: {format_size(remaining) or '0 B'}")
+
+    def eventFilter(self, watched: QObject, event) -> bool:
+        if event.type() != QEvent.KeyPress:
+            return super().eventFilter(watched, event)
+        if QApplication.activeWindow() is not self:
+            return super().eventFilter(watched, event)
+        if event.isAutoRepeat() or event.modifiers() != Qt.NoModifier:
+            return super().eventFilter(watched, event)
+
+        focus = QApplication.focusWidget()
+        if isinstance(focus, (QLineEdit, QPlainTextEdit, QSpinBox, QDoubleSpinBox, QComboBox)):
+            return super().eventFilter(watched, event)
+        if not self.current_sound:
+            return super().eventFilter(watched, event)
+
+        key = event.key()
+        if key == Qt.Key_Space:
+            self.toggle_play_pause()
+            return True
+        if key == Qt.Key_I:
+            self.set_selection_marker_at_cursor("in")
+            return True
+        if key == Qt.Key_O:
+            self.set_selection_marker_at_cursor("out")
+            return True
+        return super().eventFilter(watched, event)
 
     def show_log_dialog(self) -> None:
         dialog = QDialog(self)
@@ -2769,6 +2815,13 @@ class FreesoundBrowser(QMainWindow):
         self.ov_modify = bool(checked)
         self._ov_dirty = True
 
+    def exclude_ll_changed(self, checked: bool) -> None:
+        self.exclude_ll_language_files = bool(checked)
+        self.config["exclude_ll_language_files"] = self.exclude_ll_language_files
+        save_config(self.config)
+        if self.results_query.strip() and not self.is_library_tab():
+            self.search()
+
     def apply_openverse_filters(self) -> None:
         if not self._ov_dirty:
             return
@@ -2937,6 +2990,8 @@ class FreesoundBrowser(QMainWindow):
         # precise duration filter; Freesound is also pre-filtered server-side).
         if self.length_min or self.length_max:
             per_source = [[s for s in lst if self._in_length_range(s)] for lst in per_source]
+        if self.exclude_ll_language_files:
+            per_source = [[s for s in lst if not is_ll_language_file(s)] for lst in per_source]
         merged = merge_sources(per_source, self.current_sort())
         fresh = []
         for sound in merged:
@@ -3439,6 +3494,37 @@ class FreesoundBrowser(QMainWindow):
         self.update_action_buttons()
         self.prepare_selection_clip()
 
+    def current_cursor_fraction(self) -> float:
+        duration = sound_duration_seconds(self.current_sound or {})
+        if self.player is not None and duration > 0:
+            state = self.player.playbackState()
+            if state in (QMediaPlayer.PlaybackState.PlayingState, QMediaPlayer.PlaybackState.PausedState):
+                return max(0.0, min(1.0, self.player.position() / (duration * 1000)))
+        if self.manual_start_fraction is not None:
+            return max(0.0, min(1.0, self.manual_start_fraction))
+        return max(0.0, min(1.0, getattr(self.large_waveform, "playhead_fraction", self.selection_start)))
+
+    def set_selection_marker_at_cursor(self, marker: str) -> None:
+        if not self.current_sound:
+            return
+        fraction = self.current_cursor_fraction()
+        min_gap = 0.001
+        if marker == "in":
+            self.selection_start = min(fraction, max(0.0, self.selection_end - min_gap))
+        else:
+            self.selection_end = max(fraction, min(1.0, self.selection_start + min_gap))
+        self.large_waveform.in_fraction = self.selection_start
+        self.large_waveform.out_fraction = self.selection_end
+        self.large_waveform.update()
+        self.current_clip_file = None
+        self.manual_start_fraction = None
+        self.status_label.setText(
+            f"{'In' if marker == 'in' else 'Out'}: {int(fraction * 100)}% "
+            f"(selection {int(self.selection_start * 100)}% - {int(self.selection_end * 100)}%)"
+        )
+        self.update_action_buttons()
+        self.prepare_selection_clip()
+
     def prepare_selection_clip(self) -> None:
         if not self.current_sound or not self.current_preview_file or not self.current_preview_file.exists():
             return
@@ -3528,11 +3614,11 @@ class FreesoundBrowser(QMainWindow):
             self._start_playback(QUrl.fromLocalFile(str(cached)), start_fraction, sid)
             return
 
-        # Not cached yet: fetch it and play as soon as it lands (avoids the slow
-        # remote-stream buffering). prepare_selection_clip/prefetch already runs
-        # on selection, so this is usually a very short wait.
-        self._pending_play = (sid, start_fraction)
-        self.status_label.setText("Loading preview…")
+        # Not cached yet: start the remote preview immediately while the chunked
+        # background download continues to prepare the local drag/import file.
+        self._pending_play = None
+        self._start_playback(QUrl(preview_url(sound)), start_fraction, sid)
+        self.status_label.setText("Streaming preview while caching…")
         self.prefetch_selected_preview(sound)
 
     def _start_playback(self, source: QUrl, start_fraction: float, sid: str) -> None:
