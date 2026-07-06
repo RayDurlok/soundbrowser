@@ -4,6 +4,14 @@ All notable changes from this point forward will be tracked here.
 
 ## Unreleased
 
+## 0.3.0 - 2026-07-06
+
+- Merged Freesound and Openverse into one search. The "Quelle" selector (Freesound / Jamendo / Wikimedia Commons) now drives a single mixed result list instead of a top-level source toggle.
+- Freesound results come from the native Freesound API again; when no Freesound API key is set, Freesound falls back to Openverse.
+- Unified the license filter (Public Domain Mark / CC0 / CC BY) across all sources (mapped to Freesound's license filter); removed the separate CC0 checkbox. Kategorie/Nutzung apply to the Openverse sources and grey out when only Freesound is selected.
+- Sorting is applied client-side across the merged results (Openverse has no server-side sort); rating/downloads only exist on Freesound, so those items fall to the end of those orders.
+- Added a "Länge" filter with min/max seconds (server-side for Freesound, client-side for the merged list so it applies to Openverse too).
+
 ## 0.2.1 - 2026-07-06
 
 - Added Linux and macOS latest-release installer/update scripts.

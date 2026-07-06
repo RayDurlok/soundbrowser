@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+from itertools import zip_longest
 import shutil
 import subprocess
 import sys
@@ -76,12 +77,14 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QSizePolicy,
     QSlider,
+    QSpinBox,
     QSplitter,
     QStyle,
     QTabWidget,
     QToolButton,
     QVBoxLayout,
     QWidget,
+    QWidgetAction,
 )
 
 try:
@@ -206,11 +209,9 @@ def load_config() -> dict[str, Any]:
     defaults = {
         "api_key": os.environ.get("FREESOUND_API_KEY", ""),
         "download_dir": str(DEFAULT_DOWNLOAD_DIR),
-        "cc0_only": True,
         "page_size": DEFAULT_PAGE_SIZE,
         "volume": 80,
         "sort": DEFAULT_SORT,
-        "source": "freesound",
         "openverse_filters": {},
         "openverse_client_id": "",
         "openverse_client_secret": "",
@@ -228,11 +229,10 @@ def load_config() -> dict[str, Any]:
     if os.environ.get("FREESOUND_API_KEY"):
         defaults["api_key"] = os.environ["FREESOUND_API_KEY"]
     log.debug(
-        "Loaded config from %s (api_key=%s, download_dir=%s, cc0_only=%s)",
+        "Loaded config from %s (api_key=%s, download_dir=%s)",
         CONFIG_PATH,
         "set" if defaults.get("api_key") else "missing",
         defaults.get("download_dir"),
-        defaults.get("cc0_only"),
     )
     return defaults
 
@@ -414,6 +414,50 @@ def source_label(sound: dict[str, Any]) -> str:
     return OPENVERSE_SOURCE_LABELS.get(source, source.replace("_", " ").title())
 
 
+def _to_float(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _to_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def merge_sources(per_source: list[list[dict[str, Any]]], sort_mode: str) -> list[dict[str, Any]]:
+    """Merge results from several sources into one client-side-sorted batch.
+
+    For relevance ("score") the sources are round-robin interleaved so no single
+    provider dominates the top. Other modes sort the combined batch by a shared
+    field; rating/downloads only exist on Freesound, so sources without them
+    fall to the end of those orders.
+    """
+    lists = [list(x) for x in per_source if x]
+    if not lists:
+        return []
+    if sort_mode in (None, "", "score"):
+        merged: list[dict[str, Any]] = []
+        for group in zip_longest(*lists):
+            merged.extend(item for item in group if item is not None)
+        return merged
+    flat = [sound for lst in lists for sound in lst]
+    keymap = {
+        "duration_asc": (lambda s: sound_duration_seconds(s), False),
+        "duration_desc": (lambda s: sound_duration_seconds(s), True),
+        "rating_desc": (lambda s: _to_float(s.get("avg_rating")), True),
+        "downloads_desc": (lambda s: _to_int(s.get("num_downloads")), True),
+        "created_desc": (lambda s: str(s.get("created") or ""), True),
+    }
+    keyfn, reverse = keymap.get(sort_mode, (None, False))
+    if keyfn is None:
+        return flat
+    return sorted(flat, key=keyfn, reverse=reverse)
+
+
 def selection_is_full(start_fraction: float, end_fraction: float) -> bool:
     return start_fraction <= 0.001 and end_fraction >= 0.999
 
@@ -535,7 +579,7 @@ class FreesoundClient:
     def update_api_key(self, api_key: str) -> None:
         self.api_key = api_key
 
-    def search(self, query: str, cc0_only: bool, page_size: int, sort: str = DEFAULT_SORT) -> dict[str, Any]:
+    def search(self, query: str, page_size: int, sort: str = DEFAULT_SORT, license_filter: str = "") -> dict[str, Any]:
         if not self.api_key:
             raise RuntimeError("Add a Freesound API key in Settings first.")
         params = {
@@ -544,12 +588,12 @@ class FreesoundClient:
             "fields": SEARCH_FIELDS,
             "sort": sort or DEFAULT_SORT,
         }
-        if cc0_only:
-            params["filter"] = 'license:"Creative Commons 0"'
+        if license_filter:
+            params["filter"] = license_filter
         url = f"{API_BASE}/search/?{urllib.parse.urlencode(params)}"
-        log.info("Search: query=%r cc0_only=%s sort=%s page_size=%d", query, cc0_only, sort, page_size)
+        log.info("Freesound search: query=%r sort=%s license=%r page_size=%d", query, sort, license_filter, page_size)
         response = request_json(url, self.api_key)
-        log.info("Search returned %s matches (%d in page)", response.get("count"), len(response.get("results", [])))
+        log.info("Freesound returned %s matches (%d in page)", response.get("count"), len(response.get("results", [])))
         return response
 
     def fetch_url(self, url: str) -> dict[str, Any]:
@@ -626,12 +670,47 @@ OPENVERSE_LICENSES = [
     ("CC0", "cc0"),
     ("CC BY", "by"),
 ]
-# Freesound is excluded by default so Openverse only adds NEW content (no dupes).
+# Unified source selector: Freesound (native) plus the two Openverse-only sources.
+UNIFIED_SOURCES = [
+    ("Freesound", "freesound"),
+    ("Jamendo", "jamendo"),
+    ("Wikimedia Commons", "wikimedia_audio"),
+]
+UNIFIED_DEFAULT_SOURCES = ["freesound", "jamendo", "wikimedia_audio"]
+# Openverse-only sources (everything except native Freesound).
+OPENVERSE_ONLY_SOURCES = ["jamendo", "wikimedia_audio"]
 OPENVERSE_DEFAULT_SOURCES = ["jamendo", "wikimedia_audio"]
 OPENVERSE_DEFAULT_LICENSES = ["pdm", "cc0", "by"]
 # Anonymous Openverse requests are capped at page_size 20; a token lifts this.
 OPENVERSE_ANON_PAGE_SIZE = 20
 OPENVERSE_AUTH_PAGE_SIZE = 50
+
+
+def freesound_license_filter(licenses: set[str] | list[str]) -> str:
+    """Map the unified license selection to a Freesound Solr license filter.
+
+    Freesound has no "Public Domain Mark"; public-domain content there is CC0.
+    Returns '' when all/none are selected (no restriction).
+    """
+    names: set[str] = set()
+    if "cc0" in licenses or "pdm" in licenses:
+        names.add("Creative Commons 0")
+    if "by" in licenses:
+        names.add("Attribution")
+    # Empty or already covering every Freesound license we can map -> no filter.
+    if not names or names == {"Creative Commons 0", "Attribution"} and set(licenses) >= {"pdm", "cc0", "by"}:
+        return ""
+    joined = " OR ".join(f'"{name}"' for name in sorted(names))
+    return f"license:({joined})"
+
+
+def freesound_duration_filter(min_s: int, max_s: int) -> str:
+    """Solr range clause for Freesound's `duration` field (0 = unbounded)."""
+    if not min_s and not max_s:
+        return ""
+    lo = f"{min_s}" if min_s else "*"
+    hi = f"{max_s}" if max_s else "*"
+    return f"duration:[{lo} TO {hi}]"
 
 
 def normalize_openverse_sound(raw: dict[str, Any]) -> dict[str, Any]:
@@ -1490,14 +1569,23 @@ class FreesoundBrowser(QMainWindow):
             self.config.get("openverse_client_id", ""),
             self.config.get("openverse_client_secret", ""),
         )
-        self.active_source = self.config.get("source", "freesound")
-        self.results_client = self.client
         ovf = self.config.get("openverse_filters", {})
-        self.ov_sources = set(ovf.get("sources", OPENVERSE_DEFAULT_SOURCES))
+        # Unified source selector: freesound + jamendo + wikimedia_audio.
+        saved_sources = ovf.get("sources", UNIFIED_DEFAULT_SOURCES)
+        self.ov_sources = set(saved_sources) or set(UNIFIED_DEFAULT_SOURCES)
         self.ov_categories = set(ovf.get("categories", []))
         self.ov_licenses = set(ovf.get("licenses", OPENVERSE_DEFAULT_LICENSES))
         self.ov_modify = bool(ovf.get("modify", False))
+        # Duration range filter in seconds (0 = unbounded).
+        self.length_min = max(0, int(ovf.get("length_min", 0) or 0))
+        self.length_max = max(0, int(ovf.get("length_max", 0) or 0))
         self._ov_dirty = False
+        # Multi-source merge/pagination state.
+        self.source_next: dict[str, str | None] = {}
+        self._shown_ids: set[str] = set()
+        self._batch_source_order: list[str] = []
+        self._batch_pending = 0
+        self._batch_append = False
         self.store = LibraryStore(CONFIG_DIR)
         self.thread_pool = QThreadPool.globalInstance()
         self.thread_pool.setMaxThreadCount(8)
@@ -1512,7 +1600,6 @@ class FreesoundBrowser(QMainWindow):
         self.sound_widgets: dict[str, SoundRowWidget] = {}
         self.library_widgets: dict[str, SoundRowWidget] = {}
         self.active_list: SoundListWidget | None = None
-        self.next_url: str | None = None
         self.total_matches = 0
         self.loading_search = False
         self.loading_more = False
@@ -1582,7 +1669,7 @@ class FreesoundBrowser(QMainWindow):
         header.setSpacing(8)
         self.query = QLineEdit()
         self.query.setObjectName("SearchBox")
-        self.query.setPlaceholderText("Search Freesound")
+        self.query.setPlaceholderText("Search sounds")
         self.query.setMinimumWidth(240)
         self.query.setMaximumWidth(520)
         self.query.textChanged.connect(self.query_changed)
@@ -1596,33 +1683,24 @@ class FreesoundBrowser(QMainWindow):
         self.sort_combo = QComboBox()
         for label, value in SORT_OPTIONS:
             self.sort_combo.addItem(label, value)
-        self.sort_combo.setToolTip("Order search results.")
+        self.sort_combo.setToolTip("Order the merged results (applied client-side).")
         self.sort_combo.currentIndexChanged.connect(self.sort_changed)
 
-        self.cc0_only = QCheckBox("CC0")
-        self.cc0_only.setToolTip("Show only Creative Commons 0 sounds.")
-        self.cc0_only.toggled.connect(self.save_filter_config)
-
-        # Source selector (Freesound native vs Openverse aggregator).
-        self.source_combo = QComboBox()
-        self.source_combo.addItem("Freesound", "freesound")
-        self.source_combo.addItem("Openverse", "openverse")
-        idx = self.source_combo.findData(self.active_source)
-        self.source_combo.setCurrentIndex(idx if idx >= 0 else 0)
-        self.source_combo.setToolTip("Search Freesound, or Openverse (Jamendo, Wikimedia, …).")
-        self.source_combo.currentIndexChanged.connect(self.source_changed)
-
-        # Openverse filter dropdowns (shown only in Openverse mode).
-        self.ov_filter_widgets: list[QWidget] = []
+        # Unified filter dropdowns. "Quelle" is the source selector (Freesound
+        # native + Jamendo/Wikimedia via Openverse). "Lizenzen" applies to all
+        # sources; Kategorie/Nutzung only affect the Openverse sources.
         self.ov_quelle_btn = self._make_filter_button(
-            "Quelle", OPENVERSE_SOURCES, self.ov_sources, "sources")
+            "Quelle", UNIFIED_SOURCES, self.ov_sources, "sources")
         self.ov_kategorie_btn = self._make_category_button()
         self.ov_lizenz_btn = self._make_filter_button(
             "Lizenzen", OPENVERSE_LICENSES, self.ov_licenses, "licenses")
         self.ov_nutzung_btn = self._make_usage_button()
+        self.length_btn = self._make_length_button()
         self.ov_filter_widgets = [
-            self.ov_quelle_btn, self.ov_kategorie_btn, self.ov_nutzung_btn, self.ov_lizenz_btn,
+            self.ov_quelle_btn, self.ov_kategorie_btn, self.ov_nutzung_btn,
+            self.ov_lizenz_btn, self.length_btn,
         ]
+        self.sort_widgets = [sort_label, self.sort_combo]
 
         self.settings_button = QToolButton()
         self.settings_button.setObjectName("IconButton")
@@ -1640,12 +1718,14 @@ class FreesoundBrowser(QMainWindow):
         header.addWidget(self.query, 2)
         header.addWidget(self.search_button)
         header.addSpacing(8)
-        header.addWidget(self.source_combo)
+        header.addWidget(self.ov_quelle_btn)
+        header.addWidget(self.ov_kategorie_btn)
+        header.addWidget(self.ov_nutzung_btn)
+        header.addWidget(self.ov_lizenz_btn)
+        header.addWidget(self.length_btn)
+        header.addSpacing(8)
         header.addWidget(sort_label)
         header.addWidget(self.sort_combo)
-        header.addWidget(self.cc0_only)
-        for widget in self.ov_filter_widgets:
-            header.addWidget(widget)
         header.addStretch(1)
         header.addWidget(self.settings_button)
         layout.addWidget(self.search_bar)
@@ -2118,7 +2198,6 @@ class FreesoundBrowser(QMainWindow):
         )
 
     def apply_config_to_ui(self) -> None:
-        self.cc0_only.setChecked(bool(self.config["cc0_only"]))
         self.volume.setValue(int(self.config["volume"]))
         self.set_volume(int(self.config["volume"]))
         index = self.sort_combo.findData(self.config.get("sort", DEFAULT_SORT))
@@ -2166,7 +2245,6 @@ class FreesoundBrowser(QMainWindow):
         self.status_label.setText(message)
 
     def save_filter_config(self) -> None:
-        self.config["cc0_only"] = self.cc0_only.isChecked()
         self.config["page_size"] = DEFAULT_PAGE_SIZE
         save_config(self.config)
 
@@ -2264,21 +2342,23 @@ class FreesoundBrowser(QMainWindow):
         finally:
             self._syncing_query = False
 
-        is_openverse = self.active_source == "openverse"
-        placeholder = "Search Library" if is_library else ("Search Openverse" if is_openverse else "Search Freesound")
-        self.query.setPlaceholderText(placeholder)
+        self.query.setPlaceholderText("Search Library" if is_library else "Search sounds")
         self.search_button.setText("Filter" if is_library else "Search")
         self.search_button.setEnabled(is_library or not self.loading_search)
-        self.source_combo.setVisible(not is_library)
-        # Freesound-only filters
-        self.sort_combo.setVisible(not is_library and not is_openverse)
-        self.cc0_only.setVisible(not is_library and not is_openverse)
-        for label in self.search_bar.findChildren(QLabel):
-            if label.objectName() == "FieldLabel":
-                label.setVisible(not is_library and not is_openverse)
-        # Openverse-only filters
-        for widget in self.ov_filter_widgets:
-            widget.setVisible(not is_library and is_openverse)
+        # Search filters + sort: visible in the Results tab, hidden in Library.
+        for widget in (*self.ov_filter_widgets, *self.sort_widgets):
+            widget.setVisible(not is_library)
+        # Kategorie/Nutzung only affect the Openverse sources -> grey out when no
+        # Openverse source is active.
+        ov_active = self._uses_openverse()
+        self.ov_kategorie_btn.setEnabled(ov_active)
+        self.ov_nutzung_btn.setEnabled(ov_active)
+
+    def _uses_openverse(self) -> bool:
+        if any(s in self.ov_sources for s in OPENVERSE_ONLY_SOURCES):
+            return True
+        # Freesound falls back to Openverse when no native API key is set.
+        return "freesound" in self.ov_sources and not self.client.api_key
 
     def _make_filter_button(self, text, options, selected_set, key) -> QToolButton:
         button = QToolButton()
@@ -2360,12 +2440,77 @@ class FreesoundBrowser(QMainWindow):
         button.setMenu(menu)
         return button
 
+    def _make_length_button(self) -> QToolButton:
+        button = QToolButton()
+        button.setObjectName("FilterButton")
+        button.setPopupMode(QToolButton.InstantPopup)
+        menu = QMenu(self)
+        panel = QWidget()
+        form = QFormLayout(panel)
+        form.setContentsMargins(12, 10, 12, 10)
+        self.length_min_spin = QSpinBox()
+        self.length_max_spin = QSpinBox()
+        for spin in (self.length_min_spin, self.length_max_spin):
+            spin.setRange(0, 3600)
+            spin.setSuffix(" s")
+            spin.setSpecialValueText("–")  # 0 means "no limit"
+            spin.setFixedWidth(90)
+        self.length_min_spin.setValue(self.length_min)
+        self.length_max_spin.setValue(self.length_max)
+        self.length_min_spin.valueChanged.connect(self._length_changed)
+        self.length_max_spin.valueChanged.connect(self._length_changed)
+        reset = QPushButton("Zurücksetzen")
+        reset.clicked.connect(self._reset_length)
+        form.addRow("Min", self.length_min_spin)
+        form.addRow("Max", self.length_max_spin)
+        form.addRow("", reset)
+        action = QWidgetAction(menu)
+        action.setDefaultWidget(panel)
+        menu.addAction(action)
+        menu.aboutToHide.connect(self.apply_openverse_filters)
+        button.setMenu(menu)
+        self._length_button = button
+        self._update_length_button_text()
+        return button
+
+    def _update_length_button_text(self) -> None:
+        lo, hi = self.length_min, self.length_max
+        if not lo and not hi:
+            text = "Länge"
+        else:
+            lo_s = format_duration(lo) if lo else "0:00"
+            hi_s = format_duration(hi) if hi else "∞"
+            text = f"Länge {lo_s}–{hi_s}"
+        self._length_button.setText(text)
+
+    def _length_changed(self) -> None:
+        self.length_min = self.length_min_spin.value()
+        self.length_max = self.length_max_spin.value()
+        self._update_length_button_text()
+        self._ov_dirty = True
+
+    def _reset_length(self) -> None:
+        self.length_min_spin.setValue(0)
+        self.length_max_spin.setValue(0)  # valueChanged -> _length_changed
+
+    def _in_length_range(self, sound: dict[str, Any]) -> bool:
+        duration = sound_duration_seconds(sound)
+        if self.length_min and duration < self.length_min:
+            return False
+        if self.length_max and duration > self.length_max:
+            return False
+        return True
+
     def ov_filter_changed(self, key: str, value: str, checked: bool) -> None:
         target = {"sources": self.ov_sources, "categories": self.ov_categories, "licenses": self.ov_licenses}[key]
         if checked:
             target.add(value)
         else:
             target.discard(value)
+        if key == "sources":
+            # Re-gate Kategorie/Nutzung when the active sources change.
+            self.ov_kategorie_btn.setEnabled(self._uses_openverse())
+            self.ov_nutzung_btn.setEnabled(self._uses_openverse())
         self._ov_dirty = True
 
     def ov_modify_changed(self, checked: bool) -> None:
@@ -2377,11 +2522,10 @@ class FreesoundBrowser(QMainWindow):
             return
         self._ov_dirty = False
         self.save_source_config()
-        if self.active_source == "openverse" and self.results_query.strip() and not self.is_library_tab():
+        if self.results_query.strip() and not self.is_library_tab():
             self.search()
 
-    def openverse_filters(self) -> dict[str, Any]:
-        sources = sorted(self.ov_sources) or list(OPENVERSE_DEFAULT_SOURCES)
+    def openverse_filters(self, sources: list[str]) -> dict[str, Any]:
         license_type = ["commercial"]
         if self.ov_modify:
             license_type.append("modification")
@@ -2392,21 +2536,14 @@ class FreesoundBrowser(QMainWindow):
             "license_type": license_type,
         }
 
-    def source_changed(self) -> None:
-        self.active_source = self.source_combo.currentData() or "freesound"
-        log.info("Search source changed to %s", self.active_source)
-        self.save_source_config()
-        self.update_header_mode()
-        if self.results_query.strip() and not self.is_library_tab():
-            self.search()
-
     def save_source_config(self) -> None:
-        self.config["source"] = self.active_source
         self.config["openverse_filters"] = {
             "sources": sorted(self.ov_sources),
             "categories": sorted(self.ov_categories),
             "licenses": sorted(self.ov_licenses),
             "modify": self.ov_modify,
+            "length_min": self.length_min,
+            "length_max": self.length_max,
         }
         save_config(self.config)
 
@@ -2418,6 +2555,9 @@ class FreesoundBrowser(QMainWindow):
             return
         if not query or self.loading_search:
             return
+        if not self.ov_sources:
+            self.status_label.setText("Pick at least one source (Quelle).")
+            return
         self.results_query = query
         self.save_filter_config()
         self.results.clear()
@@ -2425,30 +2565,14 @@ class FreesoundBrowser(QMainWindow):
         self.current_sound = None
         self.current_preview_file = None
         self.current_waveform_file = None
-        self.next_url = None
+        self.source_next = {}
+        self._shown_ids = set()
         self.total_matches = 0
         self.update_detail(None)
         self.update_action_buttons()
 
-        if self.active_source == "openverse":
-            client = self.openverse
-            filters = self.openverse_filters()
-            message = "Searching Openverse…"
-
-            def do_search():
-                return client.search(query, filters, DEFAULT_PAGE_SIZE)
-        else:
-            client = self.client
-            cc0 = self.cc0_only.isChecked()
-            sort = self.current_sort()
-            message = "Searching Freesound..."
-
-            def do_search():
-                return client.search(query, cc0, DEFAULT_PAGE_SIZE, sort)
-
-        self.results_client = client
-        self.set_busy(True, message)
-        self.run_worker(message, do_search, self.populate_results, done_handler=lambda: self.set_busy(False))
+        self.set_busy(True, "Searching…")
+        self._start_batch(append=False)
 
     def current_sort(self) -> str:
         return self.sort_combo.currentData() or DEFAULT_SORT
@@ -2466,33 +2590,119 @@ class FreesoundBrowser(QMainWindow):
             self.load_more()
 
     def load_more(self) -> None:
-        if not self.next_url or self.loading_more or self.loading_search:
+        if self.loading_more or self.loading_search:
+            return
+        if not any(self.source_next.values()):
             return
         self.loading_more = True
+        self._start_batch(append=True)
 
-        client = self.results_client
+    # ----- unified multi-source fetch / merge -------------------------
+    def _build_fetchers(self, append: bool) -> list[tuple[str, Any]]:
+        query = self.results_query.strip()
+        fetchers: list[tuple[str, Any]] = []
+        api_key = bool(self.client.api_key)
 
-        def do_load_more():
-            return client.fetch_more(self.next_url or "")
+        # Native Freesound (only when an API key is set).
+        if "freesound" in self.ov_sources and api_key:
+            if append:
+                nxt = self.source_next.get("freesound")
+                if nxt:
+                    fetchers.append(("freesound", lambda nxt=nxt: self.client.fetch_more(nxt)))
+            else:
+                parts = [
+                    freesound_license_filter(self.ov_licenses),
+                    freesound_duration_filter(self.length_min, self.length_max),
+                ]
+                filter_str = " ".join(p for p in parts if p)
+                sort = self.current_sort()
+                fetchers.append((
+                    "freesound",
+                    lambda: self.client.search(query, DEFAULT_PAGE_SIZE, sort, filter_str),
+                ))
 
-        self.run_worker("Loading more results...", do_load_more, self.append_results, done_handler=self.load_more_finished)
+        # Openverse: Jamendo/Wikimedia, plus Freesound as a fallback if no key.
+        ov_sources = [s for s in OPENVERSE_ONLY_SOURCES if s in self.ov_sources]
+        if "freesound" in self.ov_sources and not api_key:
+            ov_sources = ["freesound"] + ov_sources
+        if ov_sources:
+            if append:
+                nxt = self.source_next.get("openverse")
+                if nxt:
+                    fetchers.append(("openverse", lambda nxt=nxt: self.openverse.fetch_more(nxt)))
+            else:
+                filters = self.openverse_filters(ov_sources)
+                fetchers.append((
+                    "openverse",
+                    lambda: self.openverse.search(query, filters, DEFAULT_PAGE_SIZE),
+                ))
+        return fetchers
 
-    def load_more_finished(self) -> None:
-        self.loading_more = False
+    @staticmethod
+    def _wrap_source(key, fn):
+        def task():
+            return key, fn()
+        return task
 
-    def populate_results(self, response: dict[str, Any]) -> None:
-        self.results.clear()
-        self.append_results(response)
+    def _start_batch(self, append: bool) -> None:
+        fetchers = self._build_fetchers(append)
+        self._batch_append = append
+        self._batch_source_order = [key for key, _ in fetchers]
+        self._batch_per_source: dict[str, list] = {}
+        self._batch_next: dict[str, str | None] = {}
+        self._batch_count = 0
+        self._batch_pending = len(fetchers)
+        if not fetchers:
+            self._finalize_batch()
+            return
+        for key, fn in fetchers:
+            worker = FunctionWorker(self._wrap_source(key, fn), label=f"search:{key}")
+            worker.signals.result.connect(self._on_source_result)
+            worker.signals.error.connect(lambda message, k=key: self._on_source_error(k, message))
+            worker.signals.finished.connect(self._on_source_done)
+            self.start_worker(worker)
 
-    def append_results(self, response: dict[str, Any]) -> None:
-        self.next_url = response.get("next")
-        self.total_matches = int(response.get("count") or self.total_matches or 0)
-        for sound in response.get("results", []):
+    def _on_source_result(self, payload) -> None:
+        key, response = payload
+        self._batch_per_source[key] = response.get("results", [])
+        self._batch_next[key] = response.get("next")
+        self._batch_count += _to_int(response.get("count"))
+
+    def _on_source_error(self, key: str, message: str) -> None:
+        log.warning("Search source %s failed: %s", key, message)
+        self._batch_per_source.setdefault(key, [])
+        self._batch_next[key] = None
+
+    def _on_source_done(self) -> None:
+        self._batch_pending -= 1
+        if self._batch_pending <= 0:
+            self._finalize_batch()
+
+    def _finalize_batch(self) -> None:
+        self.source_next = dict(self._batch_next)
+        per_source = [self._batch_per_source.get(key, []) for key in self._batch_source_order]
+        # Length filter client-side so it applies uniformly (Openverse has no
+        # precise duration filter; Freesound is also pre-filtered server-side).
+        if self.length_min or self.length_max:
+            per_source = [[s for s in lst if self._in_length_range(s)] for lst in per_source]
+        merged = merge_sources(per_source, self.current_sort())
+        fresh = []
+        for sound in merged:
+            uid = f"{sound.get('_provider', 'freesound')}:{sound_id(sound)}"
+            if uid in self._shown_ids:
+                continue
+            self._shown_ids.add(uid)
+            fresh.append(sound)
+        if not self._batch_append:
+            self.total_matches = self._batch_count
+        for sound in fresh:
             self.add_sound_row(sound, self.results, self.sound_widgets)
         loaded = self.results.count()
         self.status_label.setText(f"{loaded} of {self.total_matches} matches loaded")
         if loaded > 0 and not self.current_sound:
             self.results.setCurrentRow(0)
+        self.set_busy(False)
+        self.loading_more = False
 
     def add_sound_row(self, sound: dict[str, Any], target_list: SoundListWidget, widget_map: dict) -> None:
         item = QListWidgetItem()

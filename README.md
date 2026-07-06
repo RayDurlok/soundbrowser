@@ -1,9 +1,9 @@
 # Resolve Freesound Browser
 
 Resolve Freesound Browser is a small desktop sound browser for DaVinci Resolve
-workflows. It searches Freesound, previews sounds, shows waveforms and metadata,
-trims preview ranges, and lets you drag or import the resulting audio into
-Resolve.
+workflows. It searches Freesound and Openverse sources, previews sounds, shows
+waveforms and metadata, trims preview ranges, and lets you drag or import the
+resulting audio into Resolve.
 
 The app is intentionally standalone. DaVinci Resolve does not expose a public
 Linux API for a true docked panel, so this tool runs next to Resolve and uses
@@ -11,10 +11,12 @@ normal file drag/drop plus optional Resolve scripting import.
 
 ## Features
 
+- Unified Freesound, Jamendo, and Wikimedia Commons search
 - Freesound APIv2 search through `https://freesound.org/apiv2/search/`
+- Freesound fallback through Openverse when no Freesound API key is configured
 - API-key authentication for search, preview access, waveform images, and metadata
 - Sort modes: relevance, rating, most downloaded, newest, duration
-- CC0-only filter
+- Source, license, category, usage, and length filters
 - Infinite scroll / automatic result loading
 - Modern dark UI with result waveforms and rating stars
 - Preview playback with play/pause, next, volume, click-to-seek, and playhead
@@ -24,39 +26,6 @@ normal file drag/drop plus optional Resolve scripting import.
 - Optional import into the active Resolve Media Pool through Resolve scripting
 - Library tab with recently-used sounds and named collections
 - Rotating debug log for troubleshooting
-
-## Freesound API Key
-
-Create an API credential at:
-
-```text
-https://freesound.org/apiv2/apply/
-```
-
-Suggested fields:
-
-- `Name`: `Resolve Freesound Browser`
-- `URL`: `http://localhost`
-- `Callback URL`: `http://freesound.org/home/app_permissions/permission_granted/`
-- `Description`: `Desktop tool for searching Freesound previews and using them in DaVinci Resolve.`
-
-After creating the credential, copy the value from:
-
-```text
-Client secret / Api key
-```
-
-Then open the app and set it via:
-
-```text
-Gear button -> API key
-```
-
-You can also provide it for one run:
-
-```bash
-FREESOUND_API_KEY=your_key python3 run.py
-```
 
 ## Linux Install
 
@@ -213,6 +182,39 @@ run_windows.bat
 
 Resolve import on Windows requires Resolve scripting to be enabled and the
 standard Resolve scripting module to be installed by DaVinci Resolve.
+
+## Freesound API Key
+
+Create an API credential at:
+
+```text
+https://freesound.org/apiv2/apply/
+```
+
+Suggested fields:
+
+- `Name`: `Resolve Freesound Browser`
+- `URL`: `http://localhost`
+- `Callback URL`: `http://freesound.org/home/app_permissions/permission_granted/`
+- `Description`: `Desktop tool for searching Freesound previews and using them in DaVinci Resolve.`
+
+After creating the credential, copy the value from:
+
+```text
+Client secret / Api key
+```
+
+Then open the app and set it via:
+
+```text
+Gear button -> API key
+```
+
+You can also provide it for one run:
+
+```bash
+FREESOUND_API_KEY=your_key python3 run.py
+```
 
 ## Resolve Workflow
 
