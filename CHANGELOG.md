@@ -4,6 +4,11 @@ All notable changes from this point forward will be tracked here.
 
 ## Unreleased
 
+## 0.2.1 - 2026-07-06
+
+- Added Linux and macOS latest-release installer/update scripts.
+- Updated install and update documentation so both platforms automatically fetch the newest GitHub release.
+
 ## 0.2.0 - 2026-07-06
 
 - Added Openverse as a second search source (Jamendo, Wikimedia Commons), selectable via a Source switcher; Freesound is excluded by default to avoid duplicates.

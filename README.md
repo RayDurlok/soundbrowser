@@ -60,7 +60,15 @@ FREESOUND_API_KEY=your_key python3 run.py
 
 ## Linux Install
 
-From this folder:
+Recommended install/update command. It downloads the latest GitHub release into
+`~/Apps/ResolveFreesoundBrowser`, installs Python dependencies, registers the
+desktop launcher, and installs the Resolve script menu entry:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/RayDurlok/soundbrowser/main/install_latest_linux.sh | bash
+```
+
+Manual install from an already downloaded project folder:
 
 ```bash
 cd ~/Apps/ResolveFreesoundBrowser
@@ -103,19 +111,19 @@ package source.
 
 ## Linux Update
 
-If this folder is a Git checkout:
+Run the same latest-release installer again:
 
 ```bash
-cd ~/Apps/ResolveFreesoundBrowser
-git pull --ff-only
-python3 -m pip install --user -r requirements.txt
-./install_linux_user.sh
+curl -fsSL https://raw.githubusercontent.com/RayDurlok/soundbrowser/main/install_latest_linux.sh | bash
 ```
 
-If you update by replacing the folder manually, run:
+If this folder is a Git checkout and you prefer manual control:
 
 ```bash
 cd ~/Apps/ResolveFreesoundBrowser
+latest_tag=$(curl -fsSL https://api.github.com/repos/RayDurlok/soundbrowser/releases/latest | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')
+git fetch --tags --prune origin
+git checkout --detach "$latest_tag"
 python3 -m pip install --user -r requirements.txt
 ./install_linux_user.sh
 ```
@@ -128,7 +136,15 @@ Install Python 3 and ffmpeg first. Homebrew is the easiest route:
 brew install python ffmpeg
 ```
 
-From the project folder, create a local virtual environment and run the app:
+Recommended install/update command. It downloads the latest GitHub release into
+`~/Apps/ResolveFreesoundBrowser`, creates/updates the local virtual environment,
+and prints the start command:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/RayDurlok/soundbrowser/main/install_latest_macos.sh | bash
+```
+
+Manual install from an already downloaded project folder:
 
 ```bash
 cd ~/Apps/ResolveFreesoundBrowser
@@ -161,20 +177,19 @@ The app uses DaVinci Resolve's standard macOS scripting paths:
 
 ## macOS Update
 
-If this folder is a Git checkout:
+Run the same latest-release installer again:
 
 ```bash
-cd ~/Apps/ResolveFreesoundBrowser
-git pull --ff-only
-source .venv/bin/activate
-python -m pip install -r requirements.txt
-python run.py
+curl -fsSL https://raw.githubusercontent.com/RayDurlok/soundbrowser/main/install_latest_macos.sh | bash
 ```
 
-If the virtual environment does not exist yet:
+If this folder is a Git checkout and you prefer manual control:
 
 ```bash
 cd ~/Apps/ResolveFreesoundBrowser
+latest_tag=$(curl -fsSL https://api.github.com/repos/RayDurlok/soundbrowser/releases/latest | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')
+git fetch --tags --prune origin
+git checkout --detach "$latest_tag"
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
