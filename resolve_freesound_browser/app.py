@@ -20,7 +20,23 @@ from typing import Any, Callable
 from resolve_freesound_browser.logging_setup import LOGGER_NAME, install_excepthook, setup_logging
 from resolve_freesound_browser.store import HISTORY_KEY, LibraryStore
 
-from PySide6.QtCore import QMimeData, QObject, QPoint, QRect, QRectF, QRunnable, QSize, Qt, QThreadPool, QTimer, QUrl, Signal
+from PySide6.QtCore import (
+    QAbstractAnimation,
+    QEasingCurve,
+    QMimeData,
+    QObject,
+    QPoint,
+    QPropertyAnimation,
+    QRect,
+    QRectF,
+    QRunnable,
+    QSize,
+    Qt,
+    QThreadPool,
+    QTimer,
+    QUrl,
+    Signal,
+)
 from PySide6.QtGui import (
     QAction,
     QBrush,
@@ -44,6 +60,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QFrame,
+    QGraphicsOpacityEffect,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -1766,6 +1783,17 @@ class FreesoundBrowser(QMainWindow):
         self.drag_ready_label.setTextVisible(True)
         self.drag_ready_label.setFixedWidth(88)
         self.drag_ready_label.setFixedHeight(20)
+        # Breathing (pulsing-opacity) effect for the indeterminate loading state.
+        self._drag_breath = QGraphicsOpacityEffect(self.drag_ready_label)
+        self._drag_breath.setOpacity(1.0)
+        self.drag_ready_label.setGraphicsEffect(self._drag_breath)
+        self._drag_breath_anim = QPropertyAnimation(self._drag_breath, b"opacity", self)
+        self._drag_breath_anim.setDuration(1300)
+        self._drag_breath_anim.setStartValue(1.0)
+        self._drag_breath_anim.setKeyValueAt(0.5, 0.32)
+        self._drag_breath_anim.setEndValue(1.0)
+        self._drag_breath_anim.setEasingCurve(QEasingCurve.InOutSine)
+        self._drag_breath_anim.setLoopCount(-1)
         controls.addWidget(self.drag_ready_label)
         controls.addStretch(1)
         controls.addWidget(QLabel("Volume"))
@@ -2777,6 +2805,7 @@ class FreesoundBrowser(QMainWindow):
         if not hasattr(self, "drag_ready_label"):
             return
         text, state, tooltip = self.drag_ready_state()
+        breathing = False
         if state == "pending":
             percent = None
             if self.current_sound and self.drag_download_progress:
@@ -2784,7 +2813,11 @@ class FreesoundBrowser(QMainWindow):
                 if sid == sound_id(self.current_sound):
                     percent = current_percent
             if percent is None:
-                self.drag_ready_label.setRange(0, 0)
+                # Unknown length: full orange bar with a breathing pulse instead
+                # of Qt's sliding indeterminate chunk.
+                self.drag_ready_label.setRange(0, 100)
+                self.drag_ready_label.setValue(100)
+                breathing = True
             else:
                 self.drag_ready_label.setRange(0, 100)
                 self.drag_ready_label.setValue(percent)
@@ -2797,11 +2830,22 @@ class FreesoundBrowser(QMainWindow):
         else:
             self.drag_ready_label.setRange(0, 100)
             self.drag_ready_label.setValue(0)
+        self._set_drag_breathing(breathing)
         self.drag_ready_label.setFormat(text)
         self.drag_ready_label.setProperty("state", state)
         self.drag_ready_label.setToolTip(tooltip)
         self.drag_ready_label.style().unpolish(self.drag_ready_label)
         self.drag_ready_label.style().polish(self.drag_ready_label)
+
+    def _set_drag_breathing(self, on: bool) -> None:
+        if not hasattr(self, "_drag_breath_anim"):
+            return
+        running = self._drag_breath_anim.state() == QAbstractAnimation.Running
+        if on and not running:
+            self._drag_breath_anim.start()
+        elif not on and running:
+            self._drag_breath_anim.stop()
+            self._drag_breath.setOpacity(1.0)
 
     # ----- collections -------------------------------------------------
     def update_collection_button(self) -> None:
