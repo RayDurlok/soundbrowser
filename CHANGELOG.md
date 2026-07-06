@@ -4,6 +4,11 @@ All notable changes from this point forward will be tracked here.
 
 ## Unreleased
 
+## 0.3.1 - 2026-07-06
+
+- Added a Cache settings dialog with age retention and maximum cache size limits.
+- Added automatic cleanup for cached previews, waveform images, and trimmed drag/import files.
+
 ## 0.3.0 - 2026-07-06
 
 - Merged Freesound and Openverse into one search. The "Quelle" selector (Freesound / Jamendo / Wikimedia Commons) now drives a single mixed result list instead of a top-level source toggle.

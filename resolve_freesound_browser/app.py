@@ -58,6 +58,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -162,6 +163,8 @@ LOG_DIR = platform_cache_dir() / "logs"
 LOG_PATH = LOG_DIR / "app.log"
 DEFAULT_DOWNLOAD_DIR = Path.home() / "Freesound Downloads"
 RESOURCES_DIR = Path(__file__).resolve().parents[1] / "resources"
+CACHE_DIRS = [IMAGE_CACHE_DIR, PREVIEW_CACHE_DIR, CLIP_CACHE_DIR]
+DEFAULT_CACHE_POLICY = {"keep": "month", "months": 1, "max_gb": 5.0}
 
 log = logging.getLogger(LOGGER_NAME)
 
@@ -215,6 +218,7 @@ def load_config() -> dict[str, Any]:
         "openverse_filters": {},
         "openverse_client_id": "",
         "openverse_client_secret": "",
+        "cache_policy": dict(DEFAULT_CACHE_POLICY),
     }
     try:
         data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
@@ -226,6 +230,7 @@ def load_config() -> dict[str, Any]:
         return defaults
     defaults.update({key: data[key] for key in defaults if key in data})
     defaults["page_size"] = max(DEFAULT_PAGE_SIZE, int(defaults.get("page_size") or DEFAULT_PAGE_SIZE))
+    defaults["cache_policy"] = normalize_cache_policy(defaults.get("cache_policy"))
     if os.environ.get("FREESOUND_API_KEY"):
         defaults["api_key"] = os.environ["FREESOUND_API_KEY"]
     log.debug(
@@ -270,6 +275,125 @@ def format_size(value: Any) -> str:
         size /= 1024
         unit += 1
     return f"{size:.1f} {units[unit]}"
+
+
+def normalize_cache_policy(value: Any) -> dict[str, Any]:
+    policy = dict(DEFAULT_CACHE_POLICY)
+    if isinstance(value, dict):
+        policy.update({key: value[key] for key in policy if key in value})
+    if policy.get("keep") not in {"forever", "day", "week", "month", "custom_months"}:
+        policy["keep"] = DEFAULT_CACHE_POLICY["keep"]
+    try:
+        policy["months"] = max(1, min(60, int(policy.get("months") or 1)))
+    except (TypeError, ValueError):
+        policy["months"] = DEFAULT_CACHE_POLICY["months"]
+    try:
+        policy["max_gb"] = max(0.0, min(1024.0, float(policy.get("max_gb") or 0.0)))
+    except (TypeError, ValueError):
+        policy["max_gb"] = DEFAULT_CACHE_POLICY["max_gb"]
+    return policy
+
+
+def cache_file_entries() -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for root in CACHE_DIRS:
+        if not root.exists():
+            continue
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            entries.append({"path": path, "size": stat.st_size, "mtime": stat.st_mtime})
+    return entries
+
+
+def cache_total_size() -> int:
+    return sum(int(entry["size"]) for entry in cache_file_entries())
+
+
+def cache_cutoff_time(policy: dict[str, Any]) -> float | None:
+    keep = policy.get("keep")
+    if keep == "day":
+        days = 1
+    elif keep == "week":
+        days = 7
+    elif keep == "month":
+        days = 31
+    elif keep == "custom_months":
+        days = 31 * int(policy.get("months") or 1)
+    else:
+        return None
+    return time.time() - days * 24 * 60 * 60
+
+
+def prune_empty_cache_dirs() -> None:
+    for root in CACHE_DIRS:
+        if not root.exists():
+            continue
+        for path in sorted((p for p in root.rglob("*") if p.is_dir()), key=lambda p: len(p.parts), reverse=True):
+            try:
+                path.rmdir()
+            except OSError:
+                pass
+
+
+def cleanup_cache_files(
+    policy: dict[str, Any],
+    protected_paths: set[Path] | None = None,
+) -> tuple[int, int, int]:
+    protected: set[Path] = set()
+    for path in protected_paths or set():
+        try:
+            protected.add(path.resolve())
+        except OSError:
+            protected.add(path)
+
+    def is_protected(path: Path) -> bool:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            resolved = path
+        return resolved in protected
+
+    deleted_count = 0
+    deleted_bytes = 0
+
+    def delete_path(path: Path, size: int) -> None:
+        nonlocal deleted_count, deleted_bytes
+        if is_protected(path):
+            return
+        try:
+            path.unlink()
+        except OSError as exc:
+            log.debug("Could not delete cache file %s: %s", path, exc)
+            return
+        deleted_count += 1
+        deleted_bytes += size
+
+    cutoff = cache_cutoff_time(policy)
+    if cutoff is not None:
+        for entry in cache_file_entries():
+            if float(entry["mtime"]) < cutoff:
+                delete_path(entry["path"], int(entry["size"]))
+
+    entries = cache_file_entries()
+    total = sum(int(entry["size"]) for entry in entries)
+    max_gb = float(policy.get("max_gb") or 0.0)
+    max_bytes = int(max_gb * 1024 * 1024 * 1024)
+    if max_bytes > 0 and total > max_bytes:
+        for entry in sorted(entries, key=lambda item: float(item["mtime"])):
+            if total <= max_bytes:
+                break
+            before = deleted_bytes
+            delete_path(entry["path"], int(entry["size"]))
+            if deleted_bytes != before:
+                total -= int(entry["size"])
+
+    prune_empty_cache_dirs()
+    return deleted_count, deleted_bytes, cache_total_size()
 
 
 def preview_url(sound: dict[str, Any]) -> str:
@@ -1223,6 +1347,87 @@ class SettingsDialog(QDialog):
             self.download_dir.setText(selected)
 
 
+class CacheDialog(QDialog):
+    def __init__(self, config: dict[str, Any], clean_callback: Callable[[dict[str, Any]], tuple[int, int, int]], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Cache Settings")
+        self.clean_callback = clean_callback
+        policy = normalize_cache_policy(config.get("cache_policy"))
+
+        self.size_label = QLabel()
+        self.size_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.update_size_label()
+
+        self.keep_combo = QComboBox()
+        self.keep_combo.addItem("Forever", "forever")
+        self.keep_combo.addItem("A day", "day")
+        self.keep_combo.addItem("A week", "week")
+        self.keep_combo.addItem("A month", "month")
+        self.keep_combo.addItem("Number of months", "custom_months")
+        index = self.keep_combo.findData(policy["keep"])
+        self.keep_combo.setCurrentIndex(index if index >= 0 else 3)
+        self.keep_combo.currentIndexChanged.connect(self.update_months_enabled)
+
+        self.months_spin = QSpinBox()
+        self.months_spin.setRange(1, 60)
+        self.months_spin.setSuffix(" months")
+        self.months_spin.setValue(int(policy["months"]))
+
+        self.max_size_spin = QDoubleSpinBox()
+        self.max_size_spin.setRange(0.0, 1024.0)
+        self.max_size_spin.setDecimals(1)
+        self.max_size_spin.setSingleStep(0.5)
+        self.max_size_spin.setSuffix(" GB")
+        self.max_size_spin.setSpecialValueText("No limit")
+        self.max_size_spin.setValue(float(policy["max_gb"]))
+
+        clean_now = QPushButton("Clean now")
+        clean_now.clicked.connect(self.clean_now)
+
+        hint = QLabel("Applies to cached previews, waveforms, and trimmed drag/import files. Downloads are not deleted.")
+        hint.setWordWrap(True)
+
+        form = QFormLayout()
+        form.addRow("Current cache", self.size_label)
+        form.addRow("Keep files", self.keep_combo)
+        form.addRow("Months", self.months_spin)
+        form.addRow("Max size", self.max_size_spin)
+        form.addRow("", clean_now)
+        form.addRow("", hint)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(buttons)
+        self.update_months_enabled()
+
+    def policy(self) -> dict[str, Any]:
+        return {
+            "keep": self.keep_combo.currentData() or DEFAULT_CACHE_POLICY["keep"],
+            "months": int(self.months_spin.value()),
+            "max_gb": float(self.max_size_spin.value()),
+        }
+
+    def update_months_enabled(self) -> None:
+        self.months_spin.setEnabled(self.keep_combo.currentData() == "custom_months")
+
+    def update_size_label(self) -> None:
+        self.size_label.setText(format_size(cache_total_size()) or "0 B")
+
+    def clean_now(self) -> None:
+        deleted_count, deleted_bytes, remaining = self.clean_callback(self.policy())
+        self.update_size_label()
+        QMessageBox.information(
+            self,
+            APP_NAME,
+            f"Deleted {deleted_count} cache files ({format_size(deleted_bytes) or '0 B'}).\n"
+            f"Remaining cache: {format_size(remaining) or '0 B'}",
+        )
+
+
 class DragFileButton(QToolButton):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1639,6 +1844,7 @@ class FreesoundBrowser(QMainWindow):
         self.build_actions()
         self.build_ui()
         self.apply_config_to_ui()
+        QTimer.singleShot(1200, self.cleanup_cache_auto)
         if not ffmpeg_available():
             QTimer.singleShot(300, lambda: self.prompt_ffmpeg_install(force=False))
 
@@ -1648,6 +1854,9 @@ class FreesoundBrowser(QMainWindow):
 
         self.download_folder_action = QAction("Download folder…", self)
         self.download_folder_action.triggered.connect(self.choose_download_folder)
+
+        self.cache_action = QAction("Cache…", self)
+        self.cache_action.triggered.connect(self.open_cache_settings)
 
         self.view_log_action = QAction("View log…", self)
         self.view_log_action.triggered.connect(self.show_log_dialog)
@@ -1711,6 +1920,7 @@ class FreesoundBrowser(QMainWindow):
         settings_menu = QMenu(self)
         settings_menu.addAction(self.settings_action)
         settings_menu.addAction(self.download_folder_action)
+        settings_menu.addAction(self.cache_action)
         settings_menu.addAction(self.view_log_action)
         settings_menu.addAction(self.install_ffmpeg_action)
         self.settings_button.setMenu(settings_menu)
@@ -2269,6 +2479,48 @@ class FreesoundBrowser(QMainWindow):
         save_config(self.config)
         self.status_label.setText(f"Download folder: {selected}")
         log.info("Download folder set to %s", selected)
+
+    def cache_protected_paths(self) -> set[Path]:
+        paths = {
+            self.current_preview_file,
+            self.current_clip_file,
+            self.current_waveform_file,
+        }
+        return {Path(path) for path in paths if path}
+
+    def cleanup_cache_with_policy(self, policy: dict[str, Any]) -> tuple[int, int, int]:
+        normalized = normalize_cache_policy(policy)
+        deleted_count, deleted_bytes, remaining = cleanup_cache_files(normalized, self.cache_protected_paths())
+        if deleted_count:
+            log.info(
+                "Cache cleanup deleted %d files (%s), remaining %s",
+                deleted_count,
+                format_size(deleted_bytes),
+                format_size(remaining),
+            )
+        return deleted_count, deleted_bytes, remaining
+
+    def cleanup_cache_auto(self) -> None:
+        policy = normalize_cache_policy(self.config.get("cache_policy"))
+        deleted_count, deleted_bytes, remaining = self.cleanup_cache_with_policy(policy)
+        if deleted_count:
+            self.status_label.setText(
+                f"Cache cleaned: {format_size(deleted_bytes) or '0 B'} removed, {format_size(remaining) or '0 B'} left"
+            )
+
+    def open_cache_settings(self) -> None:
+        dialog = CacheDialog(self.config, self.cleanup_cache_with_policy, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        self.config["cache_policy"] = dialog.policy()
+        save_config(self.config)
+        deleted_count, deleted_bytes, remaining = self.cleanup_cache_with_policy(self.config["cache_policy"])
+        if deleted_count:
+            self.status_label.setText(
+                f"Cache cleaned: {format_size(deleted_bytes) or '0 B'} removed, {format_size(remaining) or '0 B'} left"
+            )
+        else:
+            self.status_label.setText(f"Cache settings saved. Cache: {format_size(remaining) or '0 B'}")
 
     def show_log_dialog(self) -> None:
         dialog = QDialog(self)

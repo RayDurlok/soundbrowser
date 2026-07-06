@@ -26,6 +26,7 @@ normal file drag/drop plus optional Resolve scripting import.
 - Optional import into the active Resolve Media Pool through Resolve scripting
 - Library tab with recently-used sounds and named collections
 - Rotating debug log for troubleshooting
+- Configurable cache cleanup by age and maximum size
 
 ## Linux Install
 
@@ -259,6 +260,15 @@ macOS:
 - Config: `~/Library/Application Support/Resolve Freesound Browser/config.json`
 - Library/history: `~/Library/Application Support/Resolve Freesound Browser/history.json` and `collections.json`
 - Cache/logs: `~/Library/Caches/Resolve Freesound Browser/`
+
+Cache cleanup is configured in:
+
+```text
+Gear button -> Cache…
+```
+
+It applies to cached previews, waveforms, and trimmed drag/import files. The
+download folder is not cleaned automatically.
 
 ## Logging
 
