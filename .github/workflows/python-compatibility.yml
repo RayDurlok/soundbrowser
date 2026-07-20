@@ -8,6 +8,7 @@ jobs:
   import-test:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.9", "3.13"]
 
@@ -16,6 +17,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+      - run: sudo apt-get update
+      - run: sudo apt-get install --yes libegl1
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -r requirements.txt
       - run: python -m py_compile resolve_freesound_browser/*.py run.py
